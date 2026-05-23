@@ -113,7 +113,12 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=10)
 
     # Infra
-    p.add_argument("--num_workers", type=int, default=8)
+    # [TPU FIX]: num_workers=0 avoids nested multiprocessing deadlocks.
+    # xmp.spawn(start_method="spawn") + WebLoader(forkserver) creates a
+    # forkserver inside the spawned process, which inherits PJRT TPU driver
+    # file descriptors and deadlocks. gcsfuse provides local-filesystem-speed
+    # I/O, so single-process loading is perfectly adequate.
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
