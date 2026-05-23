@@ -55,6 +55,22 @@ class EmptyConfig:
     pass
 
 
+class _XLANodeSplitter:
+    """Module-level picklable node splitter for WebDataset.
+
+    A local closure cannot be pickled by the forkserver/spawn multiprocessing
+    context used by xmp.spawn. This class is defined at module level so it is
+    fully picklable and can be serialized to forkserver worker processes.
+    """
+    def __init__(self, rank: int, world_size: int):
+        self.rank = rank
+        self.world_size = world_size
+
+    def __call__(self, urls):
+        urls = list(urls)
+        return urls[self.rank::self.world_size]
+
+
 def parse_args():
     p = argparse.ArgumentParser("CS-Mamba V6 — Characteristic Mamba TPU Training")
 
@@ -64,14 +80,14 @@ def parse_args():
     p.add_argument("--val_shards", type=str, default="")
 
     # Model
-    p.add_argument("--img_size", type=int, default=64)
-    p.add_argument("--patch_size", type=int, default=4)
-    p.add_argument("--d_embed", type=int, default=192)
+    p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--patch_size", type=int, default=16)
+    p.add_argument("--d_embed", type=int, default=512)
     p.add_argument("--n_mamba_layers", type=int, default=8)
     p.add_argument("--K_steps", type=int, default=4)
-    p.add_argument("--n_classes", type=int, default=200)
+    p.add_argument("--n_classes", type=int, default=1000)
     p.add_argument("--drop_path", type=float, default=0.1)
-    p.add_argument("--n_flow_groups", type=int, default=4, help="Number of flow groups for transport")
+    p.add_argument("--n_flow_groups", type=int, default=8, help="Number of flow groups for transport")
 
     # Optimizer
     p.add_argument("--batch_size", type=int, default=128, help="Per TPU core")
@@ -152,6 +168,40 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
 
 
 
+class _ApplyTransforms:
+    """Picklable per-sample transform mapper for WebDataset."""
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, sample):
+        return self.transform(sample[0]), sample[1]
+
+
+class _ApplyMix:
+    """Picklable batch-level Mixup/CutMix mapper for WebDataset."""
+    def __init__(self, mixup_prob, mixup_alpha, cutmix_alpha):
+        self.mixup_prob = mixup_prob
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+
+    def __call__(self, sample):
+        images, labels = sample
+        labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
+        if np.random.random() < self.mixup_prob:
+            mixed, la, lb, lam = mixup_data(images, labels, self.mixup_alpha)
+        else:
+            mixed, la, lb, lam = cutmix_data(images, labels, self.cutmix_alpha)
+        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+
+
+class _ApplyStackVal:
+    """Picklable batch-level validation label cast mapper for WebDataset."""
+    def __call__(self, sample):
+        images, labels = sample
+        labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
+        return images, labels
+
+
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     import torch_xla.core.xla_model as xm
     try:
@@ -161,16 +211,17 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         global_rank = 0
         global_world_size = 1
 
-    def safe_xla_nodesplitter(urls):
-        urls = list(urls)
-        return urls[global_rank::global_world_size]
+    # Use module-level picklable class — local closures cannot be pickled by
+    # the forkserver multiprocessing context used with start_method='spawn'.
+    node_splitter = _XLANodeSplitter(global_rank, global_world_size)
 
     if is_training:
         transform = T.Compose([
             T.RandomResizedCrop(flags.img_size, scale=(0.08, 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),
-            T.RandAugment(num_ops=2, magnitude=9),
-            T.ColorJitter(0.4, 0.4, 0.4),
+            # [SSM Tweak]: Removed RandAugment and ColorJitter.
+            # Recurrent/State-Space Models rely heavily on continuous spatial structures.
+            # Heavy pixel/spatial distortions can break the 2D characteristic transport flow.
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
@@ -182,22 +233,10 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 
-    def apply_transforms(sample):
-        return transform(sample[0]), sample[1]
-
-    def apply_mix(sample):
-        images, labels = sample
-        labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
-        if np.random.random() < flags.mixup_prob:
-            mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
-        else:
-            mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
-        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
-
-    def apply_stack_val(sample):
-        images, labels = sample
-        labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
-        return images, labels
+    # All mapper callables are module-level picklable classes.
+    apply_transforms_fn = _ApplyTransforms(transform)
+    apply_mix_fn = _ApplyMix(flags.mixup_prob, flags.mixup_alpha, flags.cutmix_alpha)
+    apply_stack_val_fn = _ApplyStackVal()
 
     if is_training:
         dataset = (
@@ -205,15 +244,15 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=True,
                 shardshuffle=1000,
-                nodesplitter=safe_xla_nodesplitter,
+                nodesplitter=node_splitter,
                 empty_check=False,
             )
             .shuffle(5000)
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
-            .map(apply_transforms)
+            .map(apply_transforms_fn)
             .batched(batch_size, partial=False)
-            .map(apply_mix)
+            .map(apply_mix_fn)
         )
     else:
         dataset = (
@@ -221,16 +260,17 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=False,
                 shardshuffle=False,
-                nodesplitter=safe_xla_nodesplitter,
+                nodesplitter=node_splitter,
                 empty_check=False,
             )
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
-            .map(apply_transforms)
+            .map(apply_transforms_fn)
             .batched(batch_size, partial=False)
-            .map(apply_stack_val)
+            .map(apply_stack_val_fn)
         )
 
+    mp_ctx = "forkserver" if flags.num_workers > 0 else None
     return wds.WebLoader(
         dataset,
         batch_size=None,
@@ -238,7 +278,10 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         pin_memory=True,
         prefetch_factor=2 if flags.num_workers > 0 else None,
         persistent_workers=False,
+        multiprocessing_context=mp_ctx,
     )
+
+
 
 
 class TinyImageNetDataset(torch.utils.data.Dataset):
@@ -504,4 +547,4 @@ if __name__ == "__main__":
         from datasets import load_dataset
         print("[Main] Pre-fetching Tiny-ImageNet cache...")
         load_dataset("Maysee/tiny-imagenet")
-    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="fork")
+    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="spawn")

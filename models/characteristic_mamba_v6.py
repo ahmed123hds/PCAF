@@ -146,17 +146,20 @@ class CharacteristicTransport2D(nn.Module):
         Returns: routing weights (B, G, 9, H, W) summing to 1 along dim=2.
         """
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        logits = torch.stack([
-            self_logits,
-            -vx,
-            vx,
-            -vy,
-            vy,
-            (-vx - vy) * inv_sqrt2,
-            (-vx + vy) * inv_sqrt2,
-            (vx - vy) * inv_sqrt2,
-            (vx + vy) * inv_sqrt2,
-        ], dim=2) / temperature
+        # [XLA FIX]: Avoid torch.stack which triggers XLA MultiOutputFusion
+        # compiler deadlocks. Use pre-allocated tensor with slice writes instead.
+        B, G, H, W = self_logits.shape
+        logits = torch.empty(B, G, 9, H, W, device=self_logits.device, dtype=self_logits.dtype)
+        logits[:, :, 0] = self_logits
+        logits[:, :, 1] = -vx
+        logits[:, :, 2] = vx
+        logits[:, :, 3] = -vy
+        logits[:, :, 4] = vy
+        logits[:, :, 5] = (-vx - vy) * inv_sqrt2
+        logits[:, :, 6] = (-vx + vy) * inv_sqrt2
+        logits[:, :, 7] = (vx - vy) * inv_sqrt2
+        logits[:, :, 8] = (vx + vy) * inv_sqrt2
+        logits = logits / temperature
         return F.softmax(logits, dim=2)
 
     def _transport(self, state: torch.Tensor, routing: torch.Tensor) -> torch.Tensor:

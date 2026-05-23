@@ -214,6 +214,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         .batched(batch_size, partial=False)
     )
     dataset = dataset.map(apply_mix if is_training else apply_stack_val)
+    mp_ctx = "forkserver" if flags.num_workers > 0 else None
     return wds.WebLoader(
         dataset,
         batch_size=None,
@@ -221,7 +222,9 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         pin_memory=True,
         prefetch_factor=2 if flags.num_workers > 0 else None,
         persistent_workers=flags.num_workers > 0,
+        multiprocessing_context=mp_ctx,
     )
+
 
 
 class TinyImageNetDataset(torch.utils.data.Dataset):
@@ -488,4 +491,4 @@ if __name__ == "__main__":
         from datasets import load_dataset
         print("[Main] Pre-fetching Tiny-ImageNet cache...")
         load_dataset("Maysee/tiny-imagenet")
-    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="fork")
+    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="spawn")
