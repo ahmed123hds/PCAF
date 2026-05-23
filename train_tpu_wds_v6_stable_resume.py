@@ -113,7 +113,7 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=10)
 
     # Infra
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
