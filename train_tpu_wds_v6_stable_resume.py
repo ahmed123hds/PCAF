@@ -402,6 +402,8 @@ def build_tiny_loader(flags, is_training=True):
         ])
     else:
         transform = T.Compose([
+            T.Resize(int(flags.img_size * 1.14), interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(flags.img_size),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
@@ -573,7 +575,7 @@ def _mp_fn(index, flags):
             total_correct += mixed_top1(logits, labels_a, labels_b, float(lam))
             total += images.size(0)
 
-            if step > 0 and step % (50 if is_imagenet else 10) == 0:
+            if step > 0 and step % 100 == 0:
                 xm.master_print(
                     f"E{epoch:03d} | Step {step}/{train_steps} | "
                     f"Loss {loss.item():.4f} | Rate {tracker.global_rate():.1f} img/s"
