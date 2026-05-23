@@ -174,6 +174,7 @@ def parse_args():
 
     # Infra
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--prefetch_factor", type=int, default=2, help="Batches prefetched per WebDataset worker when num_workers > 0")
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
@@ -339,7 +340,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         batch_size=None,
         num_workers=flags.num_workers,
         pin_memory=False,
-        prefetch_factor=2 if flags.num_workers > 0 else None,
+        prefetch_factor=flags.prefetch_factor if flags.num_workers > 0 else None,
         persistent_workers=False,
         multiprocessing_context=mp_ctx,
     )
