@@ -19,12 +19,14 @@ import math
 import argparse
 import random
 import gc
+import signal
 from itertools import islice
 from dataclasses import dataclass
 
 import numpy as np
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 _orig_excepthook = threading.excepthook
 
@@ -50,6 +52,52 @@ from models.characteristic_mamba_v6 import CSMamba_V6
 @dataclass
 class EmptyConfig:
     pass
+
+
+_TERMINATING = False
+
+
+def _make_process_group():
+    """Keep spawned TPU ranks in a process group the launcher can clean up."""
+    try:
+        if os.getpid() != os.getpgrp():
+            os.setpgrp()
+    except OSError:
+        pass
+
+
+def _terminate_process_group(signum, _frame):
+    """Forward Ctrl-C/SIGTERM to all PJRT child ranks before exiting."""
+    global _TERMINATING
+    if _TERMINATING:
+        os._exit(128 + signum)
+    _TERMINATING = True
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        os.killpg(os.getpgrp(), signum)
+    except ProcessLookupError:
+        pass
+    os._exit(128 + signum)
+
+
+def _install_parent_signal_handlers():
+    signal.signal(signal.SIGINT, _terminate_process_group)
+    signal.signal(signal.SIGTERM, _terminate_process_group)
+
+
+def _set_parent_death_signal():
+    """Ask Linux to SIGTERM this rank if the xmp launcher exits unexpectedly."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        pr_set_pdeathsig = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def _forkserver_warmup():
@@ -372,6 +420,7 @@ def _maybe_autocast(flags):
 
 
 def _mp_fn(index, flags):
+    _set_parent_death_signal()
     _ensure_forkserver_started()
 
     import torch_xla.core.xla_model as xm
@@ -563,6 +612,8 @@ def _mp_fn(index, flags):
 
 
 if __name__ == "__main__":
+    _make_process_group()
+    _install_parent_signal_handlers()
     flags = parse_args()
     if flags.dataset == "tiny-imagenet":
         from datasets import load_dataset
