@@ -201,26 +201,28 @@ class CharacteristicTransport2D(nn.Module):
         s_down_left  = s_pad[:, :, 2:, :-2]
         s_down_right = s_pad[:, :, 2:, 2:]
 
-        # Efficient single-broadcast weight computation
+        # Keep the group dimension explicit so XLA never materializes the
+        # large [B, D, 9, H, W] channel-expanded routing tensor.
         scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
-        routing_bcast = routing.unsqueeze(2)  # (B, G, 1, 9, H, W)
-        combined_weight = (routing_bcast * scale).view(B, D, 9, H, W)
 
-        # [XLA FIX]: Unrolled weighted sum — avoids torch.stack on neighbors
-        # which triggers XLA MultiOutputFusion crash. The weight computation
-        # above is safe because it uses a single broadcast multiply.
+        def grouped(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.unflatten(1, (G, C))
+
+        def weight(direction: int) -> torch.Tensor:
+            return routing[:, :, direction].unsqueeze(2) * scale[:, :, :, direction]
+
         transported = (
-            s_self       * combined_weight[:, :, 0] +
-            s_up         * combined_weight[:, :, 1] +
-            s_down       * combined_weight[:, :, 2] +
-            s_left       * combined_weight[:, :, 3] +
-            s_right      * combined_weight[:, :, 4] +
-            s_up_left    * combined_weight[:, :, 5] +
-            s_up_right   * combined_weight[:, :, 6] +
-            s_down_left  * combined_weight[:, :, 7] +
-            s_down_right * combined_weight[:, :, 8]
+            grouped(s_self)       * weight(0) +
+            grouped(s_up)         * weight(1) +
+            grouped(s_down)       * weight(2) +
+            grouped(s_left)       * weight(3) +
+            grouped(s_right)      * weight(4) +
+            grouped(s_up_left)    * weight(5) +
+            grouped(s_up_right)   * weight(6) +
+            grouped(s_down_left)  * weight(7) +
+            grouped(s_down_right) * weight(8)
         )
-        return transported
+        return transported.flatten(1, 2)
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
         """
