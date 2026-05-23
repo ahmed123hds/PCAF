@@ -367,6 +367,23 @@ class TinyImageNetDataset(torch.utils.data.Dataset):
         return self.transform(image) if self.transform else image, label
 
 
+class _TinyMixupCollate:
+    """Picklable Tiny-ImageNet training collate for spawn/forkserver workers."""
+    def __init__(self, mixup_prob, mixup_alpha, cutmix_alpha):
+        self.mixup_prob = mixup_prob
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+
+    def __call__(self, batch):
+        images = torch.stack([b[0] for b in batch])
+        labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
+        if np.random.random() < self.mixup_prob:
+            mixed, la, lb, lam = mixup_data(images, labels, self.mixup_alpha)
+        else:
+            mixed, la, lb, lam = cutmix_data(images, labels, self.cutmix_alpha)
+        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+
+
 def build_tiny_loader(flags, is_training=True):
     from datasets import load_dataset
     from torch.utils.data import DataLoader, DistributedSampler
@@ -389,16 +406,8 @@ def build_tiny_loader(flags, is_training=True):
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 
-    def mixup_collate(batch):
-        images = torch.stack([b[0] for b in batch])
-        labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
-        if np.random.random() < flags.mixup_prob:
-            mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
-        else:
-            mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
-        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
-
     dataset = TinyImageNetDataset(ds["train"] if is_training else ds["valid"], transform)
+    mixup_collate = _TinyMixupCollate(flags.mixup_prob, flags.mixup_alpha, flags.cutmix_alpha)
     sampler = DistributedSampler(
         dataset,
         num_replicas=xm.xrt_world_size(),
