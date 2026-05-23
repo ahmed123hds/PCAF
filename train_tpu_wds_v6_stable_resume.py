@@ -175,6 +175,9 @@ def parse_args():
     # Infra
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--prefetch_factor", type=int, default=2, help="Batches prefetched per WebDataset worker when num_workers > 0")
+    p.add_argument("--loader_prefetch_size", type=int, default=4, help="Host-side PyTorch/XLA MpDeviceLoader queue size")
+    p.add_argument("--device_prefetch_size", type=int, default=1, help="Device-side PyTorch/XLA MpDeviceLoader queue size")
+    p.add_argument("--host_to_device_transfer_threads", type=int, default=1, help="Host-to-device transfer threads used by MpDeviceLoader")
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
@@ -504,8 +507,13 @@ def _mp_fn(index, flags):
 
     autocast_ctx = _maybe_autocast(flags)
 
-    para_train = pl.MpDeviceLoader(train_loader, device)
-    para_val = pl.MpDeviceLoader(val_loader, device)
+    xla_loader_kwargs = {
+        "loader_prefetch_size": flags.loader_prefetch_size,
+        "device_prefetch_size": flags.device_prefetch_size,
+        "host_to_device_transfer_threads": flags.host_to_device_transfer_threads,
+    }
+    para_train = pl.MpDeviceLoader(train_loader, device, **xla_loader_kwargs)
+    para_val = pl.MpDeviceLoader(val_loader, device, **xla_loader_kwargs)
 
     if flags.eval_only:
         xm.master_print("=== RUNNING EVAL ONLY ===")
