@@ -19,6 +19,7 @@ import math
 import argparse
 import random
 import gc
+from itertools import islice
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,16 +44,28 @@ import torch.optim as optim
 import torchvision.transforms as T
 import webdataset as wds
 
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-
 from models.characteristic_mamba_v6 import CSMamba_V6
 
 
 @dataclass
 class EmptyConfig:
     pass
+
+
+def _forkserver_warmup():
+    pass
+
+
+def _ensure_forkserver_started():
+    """Start the DataLoader forkserver before this rank initializes XLA/PJRT."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("forkserver")
+    proc = ctx.Process(target=_forkserver_warmup)
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"forkserver warmup failed with exit code {proc.exitcode}")
 
 
 class _XLANodeSplitter:
@@ -67,8 +80,7 @@ class _XLANodeSplitter:
         self.world_size = world_size
 
     def __call__(self, urls):
-        urls = list(urls)
-        return urls[self.rank::self.world_size]
+        yield from islice(urls, self.rank, None, self.world_size)
 
 
 def parse_args():
@@ -245,15 +257,16 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 resampled=True,
                 shardshuffle=1000,
                 nodesplitter=node_splitter,
+                workersplitter=wds.split_by_worker,
                 empty_check=False,
             )
-            .compose(wds.split_by_worker)
             .shuffle(5000)
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
             .map(apply_transforms_fn)
             .batched(batch_size, partial=False)
             .map(apply_mix_fn)
+            .with_epoch(math.ceil(1_281_167 / (batch_size * max(global_world_size, 1))))
         )
     else:
         dataset = (
@@ -262,9 +275,9 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 resampled=False,
                 shardshuffle=False,
                 nodesplitter=node_splitter,
+                workersplitter=wds.split_by_worker,
                 empty_check=False,
             )
-            .compose(wds.split_by_worker)
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
             .map(apply_transforms_fn)
@@ -305,6 +318,7 @@ class TinyImageNetDataset(torch.utils.data.Dataset):
 def build_tiny_loader(flags, is_training=True):
     from datasets import load_dataset
     from torch.utils.data import DataLoader, DistributedSampler
+    import torch_xla.core.xla_model as xm
 
     ds = load_dataset("Maysee/tiny-imagenet")
 
@@ -358,6 +372,11 @@ def _maybe_autocast(flags):
 
 
 def _mp_fn(index, flags):
+    _ensure_forkserver_started()
+
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+
     device = xm.xla_device()
     torch.manual_seed(flags.seed + index)
     np.random.seed(flags.seed + index)
@@ -549,4 +568,5 @@ if __name__ == "__main__":
         from datasets import load_dataset
         print("[Main] Pre-fetching Tiny-ImageNet cache...")
         load_dataset("Maysee/tiny-imagenet")
+    import torch_xla.distributed.xla_multiprocessing as xmp
     xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="spawn")
