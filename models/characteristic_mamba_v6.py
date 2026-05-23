@@ -146,19 +146,31 @@ class CharacteristicTransport2D(nn.Module):
         Returns: routing weights (B, G, 9, H, W) summing to 1 along dim=2.
         """
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        # [XLA FIX]: Avoid torch.stack which triggers XLA MultiOutputFusion
-        # compiler deadlocks. Use pre-allocated tensor with slice writes instead.
-        B, G, H, W = self_logits.shape
-        logits = torch.empty(B, G, 9, H, W, device=self_logits.device, dtype=self_logits.dtype)
-        logits[:, :, 0] = self_logits
-        logits[:, :, 1] = -vx
-        logits[:, :, 2] = vx
-        logits[:, :, 3] = -vy
-        logits[:, :, 4] = vy
-        logits[:, :, 5] = (-vx - vy) * inv_sqrt2
-        logits[:, :, 6] = (-vx + vy) * inv_sqrt2
-        logits[:, :, 7] = (vx - vy) * inv_sqrt2
-        logits[:, :, 8] = (vx + vy) * inv_sqrt2
+        # [XLA FIX]: Build logits via F.pad + add.
+        # Each direction is (B,G,1,H,W). We pad it to (B,G,9,H,W) placing
+        # the value at the correct index, then sum all 9. F.pad compiles
+        # into a single XLA Pad HLO with zero overhead.
+        d0 = self_logits.unsqueeze(2)               # self
+        d1 = (-vx).unsqueeze(2)                      # up
+        d2 = vx.unsqueeze(2)                          # down
+        d3 = (-vy).unsqueeze(2)                       # left
+        d4 = vy.unsqueeze(2)                          # right
+        d5 = ((-vx - vy) * inv_sqrt2).unsqueeze(2)    # up-left
+        d6 = ((-vx + vy) * inv_sqrt2).unsqueeze(2)    # up-right
+        d7 = ((vx - vy) * inv_sqrt2).unsqueeze(2)     # down-left
+        d8 = ((vx + vy) * inv_sqrt2).unsqueeze(2)     # down-right
+        # F.pad along dim=2: [left, right] padding
+        logits = (
+            F.pad(d0, [0,0, 0,0, 0,8]) +  # idx 0: pad 0 left, 8 right
+            F.pad(d1, [0,0, 0,0, 1,7]) +  # idx 1
+            F.pad(d2, [0,0, 0,0, 2,6]) +  # idx 2
+            F.pad(d3, [0,0, 0,0, 3,5]) +  # idx 3
+            F.pad(d4, [0,0, 0,0, 4,4]) +  # idx 4
+            F.pad(d5, [0,0, 0,0, 5,3]) +  # idx 5
+            F.pad(d6, [0,0, 0,0, 6,2]) +  # idx 6
+            F.pad(d7, [0,0, 0,0, 7,1]) +  # idx 7
+            F.pad(d8, [0,0, 0,0, 8,0])    # idx 8
+        )
         logits = logits / temperature
         return F.softmax(logits, dim=2)
 
@@ -280,8 +292,15 @@ class CharacteristicTransport2D(nn.Module):
         u_out = u.flatten(2).permute(0, 2, 1)                      # (B, N, D)
         v_out = v.flatten(2).permute(0, 2, 1)
 
-        combined = torch.cat([u_out, v_out], dim=-1)                # (B, N, 2D)
-        return self.proj_drop(self.out_proj(combined)) + x * self.D
+        # [XLA FIX]: Avoid torch.cat and in-place slice writes.
+        # Split out_proj weight into two halves and apply separately, then sum.
+        # This is mathematically identical to cat + matmul but uses no concat.
+        w = self.out_proj.weight                                     # (D, 2D)
+        out = (F.linear(u_out, w[:, :d_inner]) +
+               F.linear(v_out, w[:, d_inner:]))
+        if self.out_proj.bias is not None:
+            out = out + self.out_proj.bias
+        return self.proj_drop(out) + x * self.D
 
 
 # ---------------------------------------------------------------------------

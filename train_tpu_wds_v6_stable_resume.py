@@ -275,7 +275,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         dataset,
         batch_size=None,
         num_workers=flags.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         prefetch_factor=2 if flags.num_workers > 0 else None,
         persistent_workers=False,
         multiprocessing_context=mp_ctx,
