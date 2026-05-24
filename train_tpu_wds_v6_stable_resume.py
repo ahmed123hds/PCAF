@@ -665,14 +665,12 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
-        # ── Flush EMA updates before validation ────────────────────────
-        if ema is not None:
-            xm.mark_step()   # drain the EMA blend ops accumulated this epoch
-
         # ── Always evaluate on LIVE model for logging ───────────────────
-        # EMA decay=0.9999 needs ~375K steps (ImageNet 300ep) to converge.
-        # On short runs the shadow is still near random-init → misleading
-        # val numbers. VMamba's actual practice: log live model, save EMA.
+        # EMA decay=0.999 needs many steps to converge. Logging live model
+        # gives accurate training curves. EMA runs silently per-step.
+        # NOTE: Do NOT call xm.mark_step() here before validation —
+        # it causes XLA to donate the EMA shadow buffer, making it
+        # unreadable when checkpoint saving tries to access it.
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -698,11 +696,12 @@ def _mp_fn(index, flags):
         )
 
         # ALL workers must evaluate this block to prevent XLA save-barriers from deadlocking!
-        # Save EMA weights as the primary checkpoint weights when EMA is active.
-        saved_sd = ema.state_dict() if ema is not None else model.state_dict()
+        # Always save LIVE model weights — EMA shadow is XLA device memory that gets
+        # donated/freed after execution; attempting ema.state_dict() causes
+        # "ToLiteral() called on deleted/donated buffer" crash.
         ckpt = {
             "epoch": epoch,
-            "state_dict": saved_sd,
+            "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_acc": best_acc,
@@ -710,7 +709,7 @@ def _mp_fn(index, flags):
         }
         latest_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_latest.pt")
         xm.save(ckpt, latest_path, master_only=True, global_master=True)
-        
+
         if v_acc > best_acc:
             best_acc = v_acc
             best_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_best.pt")
