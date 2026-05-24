@@ -20,6 +20,7 @@ Key metrics logged:
 """
 
 import argparse
+import copy
 import time
 import sys
 import os
@@ -35,11 +36,77 @@ import torchvision
 import torchvision.transforms as T
 import numpy as np
 
+
+# ──────────────────────────────────────────────────────────────────────
+# VMamba-recipe regularization helpers
+# ──────────────────────────────────────────────────────────────────────
+
+class ModelEMA:
+    """Exponential Moving Average of model weights (VMamba uses 0.9999)."""
+    def __init__(self, model, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for s, m in zip(self.shadow.parameters(), model.parameters()):
+            s.data.mul_(self.decay).add_(m.data, alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
+
+
+def mixup_data(x, y, alpha: float = 0.8, device='cuda'):
+    """Returns mixed inputs, pairs of targets, and lambda (VMamba alpha=0.8)."""
+    if alpha > 0:
+        lam = float(np.random.beta(alpha, alpha))
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def cutmix_data(x, y, alpha: float = 1.0, device='cuda'):
+    """CutMix augmentation (VMamba alpha=1.0)."""
+    if alpha > 0:
+        lam = float(np.random.beta(alpha, alpha))
+    else:
+        lam = 1.0
+    batch_size, _, H, W = x.size()
+    index = torch.randperm(batch_size, device=device)
+
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_h = int(H * cut_ratio)
+    cut_w = int(W * cut_ratio)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    x1 = max(cx - cut_w // 2, 0)
+    x2 = min(cx + cut_w // 2, W)
+    y1 = max(cy - cut_h // 2, 0)
+    y2 = min(cy + cut_h // 2, H)
+
+    mixed_x = x.clone()
+    mixed_x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    lam_actual = 1.0 - (x2 - x1) * (y2 - y1) / (H * W)
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam_actual
+
+
+def mixup_criterion(criterion, logits, y_a, y_b, lam):
+    return lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+
 from models.patch_encoder      import PatchEmbedding
 from models.mamba_simple       import MambaClassifier
 from models.neural_ode_router  import NeuralODERouter, FixedRouterHilbert
 from models.continuous_graph_mamba import ContinuousGraphMambaClassifier as CGMamba
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba
+from models.vmamba_4d import VMamba4D
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -103,6 +170,18 @@ class ODEMamba(nn.Module):
         return self.mamba(emb)            # (B, 10)
 
 
+class CSMambaCIFAR(nn.Module):
+    """CS-Mamba V1 wrapper that enables the CUDA/Triton scan from train.py."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.model = CSMamba(cfg)
+        self.use_triton = cfg.use_triton
+
+    def forward(self, x):
+        return self.model(x, use_triton=self.use_triton)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Data
 # ──────────────────────────────────────────────────────────────────────
@@ -118,14 +197,26 @@ class AddGaussianNoise(object):
         return tensor
 
 def get_dataloaders(cfg):
-    train_tf = T.Compose([
+    # ── VMamba recipe: RandAugment + RandomErasing ──────────────────────
+    train_aug = [
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
+    ]
+    if getattr(cfg, 'randaug', False):
+        # rand-m9-mstd0.5-inc1 from VMamba / Swin Transformer recipe
+        # Use lower magnitude (e.g. 5-6) for small datasets like CIFAR-10
+        m = getattr(cfg, 'randaug_m', 9)
+        train_aug.append(T.RandAugment(num_ops=2, magnitude=m))
+    train_aug += [
         T.ToTensor(),
         T.Normalize((0.4914, 0.4822, 0.4465),
                     (0.2023, 0.1994, 0.2010)),
-        AddGaussianNoise(0., cfg.noise_std)
-    ])
+        AddGaussianNoise(0., cfg.noise_std),
+    ]
+    if getattr(cfg, 'reprob', 0.0) > 0.0:
+        train_aug.append(T.RandomErasing(p=cfg.reprob, scale=(0.02, 0.33)))
+    train_tf = T.Compose(train_aug)
+
     val_tf = T.Compose([
         T.ToTensor(),
         T.Normalize((0.4914, 0.4822, 0.4465),
@@ -152,18 +243,31 @@ def get_dataloaders(cfg):
 # Training Loop
 # ──────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None, cfg=None, ema=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+
+    mixup_alpha  = getattr(cfg, 'mixup',  0.0) if cfg else 0.0
+    cutmix_alpha = getattr(cfg, 'cutmix', 0.0) if cfg else 0.0
 
     for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
+        # ── VMamba recipe: Mixup / CutMix (applied on GPU) ───────────────
+        use_cutmix = cutmix_alpha > 0.0 and np.random.rand() < 0.5
+        use_mixup  = not use_cutmix and mixup_alpha > 0.0
+        y_a = y_b = labels
+        lam = 1.0
+        if use_cutmix:
+            imgs, y_a, y_b, lam = cutmix_data(imgs, labels, cutmix_alpha, device)
+        elif use_mixup:
+            imgs, y_a, y_b, lam = mixup_data(imgs, labels, mixup_alpha, device)
+
         if scaler is not None:
             with torch.amp.autocast('cuda'):
                 logits = model(imgs)
-                loss   = criterion(logits, labels)
+                loss   = mixup_criterion(criterion, logits, y_a, y_b, lam)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -171,13 +275,18 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
             scaler.update()
         else:
             logits = model(imgs)
-            loss   = criterion(logits, labels)
+            loss   = mixup_criterion(criterion, logits, y_a, y_b, lam)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        # ── VMamba recipe: EMA update per step (decay=0.9999 is per-step) ─
+        if ema is not None:
+            ema.update(model)
+
         total_loss += loss.item() * imgs.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
+        # Accuracy tracked on the dominant label for logging
+        correct    += (logits.argmax(1) == y_a).sum().item()
         total      += imgs.size(0)
 
     return total_loss / total, 100.0 * correct / total
@@ -210,15 +319,23 @@ def train_model(name, model, cfg, device):
     train_loader, val_loader = get_dataloaders(cfg)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.999))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.epochs)
 
     # Mixed precision only if CUDA available
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
+    # ── VMamba recipe: EMA ────────────────────────────────────────────────
+    ema_decay  = getattr(cfg, 'ema_decay',  0.0)
+    ema_warmup = getattr(cfg, 'ema_warmup', 5)   # epochs before switching to EMA eval
+    ema = ModelEMA(model, decay=ema_decay) if ema_decay > 0.0 else None
+    if ema:
+        print(f"  EMA enabled (decay={ema_decay}, eval switches to shadow after epoch {ema_warmup})")
+
     # 🚀 MAGIC TRITON KERNEL FUSION (Runs completely in SRAM)
-    if hasattr(torch, 'compile'):
+    if cfg.compile and hasattr(torch, 'compile'):
         try:
             print("  [Auto-fusing K-Step Diffusion PDEs into Triton Kernels...]")
             model = torch.compile(model)
@@ -231,7 +348,13 @@ def train_model(name, model, cfg, device):
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
         tr_loss, tr_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, scaler)
+            model, train_loader, optimizer, criterion, device, scaler, cfg=cfg, ema=ema)
+
+        # ── Always evaluate on the LIVE model for logging ─────────────────
+        # EMA decay=0.9999 is designed for 375K+ steps (ImageNet 300ep).
+        # On short runs (CIFAR 30ep ≈ 11.7K steps) the shadow never
+        # converges — evaluating on it gives misleading low val acc.
+        # VMamba's actual practice: log live model, SAVE EMA checkpoint.
         vl_loss, vl_acc = evaluate(model, val_loader, criterion, device)
         scheduler.step()
         elapsed = time.time() - t0
@@ -242,7 +365,10 @@ def train_model(name, model, cfg, device):
 
         if vl_acc > best_val_acc:
             best_val_acc = vl_acc
-            torch.save(model.state_dict(), f"{name}_best.pt")
+            # Save EMA weights if available (smoother for inference);
+            # otherwise save the live model.
+            sd = ema.state_dict() if ema is not None else model.state_dict()
+            torch.save(sd, f"{name}_best.pt")
 
         print(f"  Epoch {epoch:03d}/{cfg.epochs} | "
               f"Train {tr_acc:5.1f}% | Val {vl_acc:5.1f}% | "
@@ -262,7 +388,7 @@ def parse_args():
         description="Routing Hypothesis Experiment on CIFAR-10"
     )
     # What to run
-    p.add_argument('--mode', choices=['hilbert', 'ode', 'graph_ode', 'spatial', 'all'],
+    p.add_argument('--mode', choices=['hilbert', 'ode', 'graph_ode', 'spatial', 'vmamba', 'spatial_vmamba', 'all'],
                    default='all', help="Which model(s) to train")
 
     # Data
@@ -291,6 +417,11 @@ def parse_args():
                    help="Fixed steps for euler/rk4 solver")
     p.add_argument('--K_steps',    type=int,   default=3,
                    help="Discrete Euler steps defining forward diffusion time")
+    p.add_argument('--drop_path',  type=float, default=0.1)
+    p.add_argument('--use_triton', action='store_true',
+                   help="Use custom CUDA/Triton scan kernels for supported models")
+    p.add_argument('--compile', action='store_true',
+                   help="Optionally wrap each model with torch.compile")
 
     # Training
     p.add_argument('--epochs',       type=int,   default=30)
@@ -299,6 +430,23 @@ def parse_args():
     p.add_argument('--weight_decay', type=float, default=1e-4)
 
     p.add_argument('--seed', type=int, default=42)
+
+    # ── VMamba paper regularization (all disabled by default) ──────────
+    p.add_argument('--randaug',   action='store_true',
+                   help="RandAugment (rand-m9-mstd0.5-inc1) — VMamba recipe")
+    p.add_argument('--randaug_m', type=int, default=9,
+                   help="RandAugment magnitude (VMamba=9; use 5-6 for small datasets like CIFAR)")
+    p.add_argument('--reprob',    type=float, default=0.0,
+                   help="Random Erasing probability (VMamba uses 0.25)")
+    p.add_argument('--mixup',     type=float, default=0.0,
+                   help="Mixup alpha (VMamba uses 0.8; 0 = disabled)")
+    p.add_argument('--cutmix',    type=float, default=0.0,
+                   help="CutMix alpha (VMamba uses 1.0; 0 = disabled)")
+    p.add_argument('--ema_decay', type=float, default=0.0,
+                   help="EMA decay (VMamba uses 0.9999; 0 = disabled)")
+    p.add_argument('--ema_warmup', type=int, default=5,
+                   help="Epochs before switching val eval to EMA shadow (avoids cold-start)")
+
     return p.parse_args()
 
 
@@ -307,6 +455,7 @@ def main():
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+    cfg.n_classes = 10
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
@@ -329,10 +478,14 @@ def main():
         model_g = CGMamba(cfg).to(device)
         results['CGMamba'] = train_model('CGMamba', model_g, cfg, device)
 
-    if cfg.mode in ('spatial', 'all'):
+    if cfg.mode in ('spatial', 'spatial_vmamba', 'all'):
         setattr(cfg, 'canvas_size', cfg.img_size) # for compatibility
-        model_s = CSMamba(cfg).to(device)
+        model_s = CSMambaCIFAR(cfg).to(device)
         results['CSMamba'] = train_model('CSMamba', model_s, cfg, device)
+
+    if cfg.mode in ('vmamba', 'spatial_vmamba', 'all'):
+        model_v = VMamba4D(cfg).to(device)
+        results['VMamba4D'] = train_model('VMamba4D', model_v, cfg, device)
 
     # ── Summary comparison ────────────────────────────────────────────
     if len(results) > 1:

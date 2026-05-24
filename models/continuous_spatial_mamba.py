@@ -96,7 +96,11 @@ class ContinuousSpatialSSM(nn.Module):
         self.D       = nn.Parameter(torch.ones(d_inner))
         
         # S4 / Mamba Log-decay initialization
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32)).unsqueeze(0).expand(d_inner, -1))
+        self.A_log = nn.Parameter(
+            torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
+            .unsqueeze(0)
+            .repeat(d_inner, 1)
+        )
 
         # --- PHYSICS-INFORMED THERMODYNAMIC DIFFUSION ---
         # Fixed Mathematical Laplacian ∇² Operator (Non-Learnable physics constraint)

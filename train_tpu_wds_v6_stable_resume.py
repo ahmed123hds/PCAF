@@ -11,6 +11,7 @@ If you want global XLA BF16 remapping, set it outside the script before launch:
   export XLA_USE_BF16=1
 """
 
+import copy
 import os
 import sys
 import threading
@@ -168,6 +169,13 @@ def parse_args():
     p.add_argument("--cutmix_alpha", type=float, default=1.0)
     p.add_argument("--mixup_prob", type=float, default=0.5)
     p.add_argument("--label_smooth", type=float, default=0.1)
+    # ── VMamba paper additions ──────────────────────────────────────────
+    p.add_argument("--randaug", action="store_true",
+                   help="Enable RandAugment (rand-m9) in training pipeline [CPU-side]")
+    p.add_argument("--reprob", type=float, default=0.25,
+                   help="RandomErasing probability (VMamba=0.25, 0=disabled) [CPU-side]")
+    p.add_argument("--ema_decay", type=float, default=0.9999,
+                   help="EMA shadow model decay (VMamba=0.9999, 0=disabled) [TPU static graph]")
 
     # Checkpoint
     p.add_argument("--resume", type=str, default="")
@@ -187,9 +195,15 @@ def parse_args():
     return p.parse_args()
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Mixup / CutMix — ALL randomness (beta, randperm, randint) lives on CPU.
+# These run inside DataLoader workers before MpDeviceLoader ships tensors
+# to the TPU, so the XLA graph sees static-shape tensors only.
+# ─────────────────────────────────────────────────────────────────────
 def mixup_data(images, labels, alpha=0.8):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    index = torch.randperm(images.size(0))
+    # CPU randperm — index never touches XLA; avoids dynamic graph recompile
+    index = torch.randperm(images.size(0))      # CPU tensor
     mixed = lam * images + (1.0 - lam) * images[index]
     return mixed, labels, labels[index], float(lam)
 
@@ -197,9 +211,10 @@ def mixup_data(images, labels, alpha=0.8):
 def cutmix_data(images, labels, alpha=1.0):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     bsz, _, h, w = images.shape
-    index = torch.randperm(bsz)
+    index = torch.randperm(bsz)                 # CPU tensor
     cut_ratio = np.sqrt(1.0 - lam)
     cut_h, cut_w = int(h * cut_ratio), int(w * cut_ratio)
+    # np.random.randint — CPU scalar, not an XLA op
     cy, cx = np.random.randint(h), np.random.randint(w)
     y1, y2 = max(0, cy - cut_h // 2), min(h, cy + cut_h // 2)
     x1, x2 = max(0, cx - cut_w // 2), min(w, cx + cut_w // 2)
@@ -234,6 +249,32 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+
+
+# ─────────────────────────────────────────────────────────────────────
+# EMA — shadow model lives on the TPU device but its update is a
+# fixed-shape linear blend: s = decay*s + (1-decay)*m.
+# XLA sees the same static arithmetic graph every epoch → zero recompile.
+# ─────────────────────────────────────────────────────────────────────
+class ModelEMA:
+    """EMA shadow model for TPU. Update is a static graph; no recompile."""
+    def __init__(self, model, decay: float = 0.9999):
+        self.decay = decay
+        # deepcopy on CPU first, then move to same device as model
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        """Call after xm.optimizer_step(); flush with xm.mark_step() outside."""
+        for s, m in zip(self.shadow.parameters(), model.parameters()):
+            # Static linear blend — same graph shape every call.
+            s.data.mul_(self.decay).add_(m.data, alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
 
 
 class _ApplyTransforms:
@@ -284,15 +325,21 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     node_splitter = _XLANodeSplitter(global_rank, global_world_size)
 
     if is_training:
-        transform = T.Compose([
+        train_aug = [
             T.RandomResizedCrop(flags.img_size, scale=(0.08, 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),
-            # [SSM Tweak]: Removed RandAugment and ColorJitter.
-            # Recurrent/State-Space Models rely heavily on continuous spatial structures.
-            # Heavy pixel/spatial distortions can break the 2D characteristic transport flow.
+        ]
+        # VMamba recipe: RandAugment (opt-in via --randaug) — CPU-side, safe.
+        if getattr(flags, 'randaug', False):
+            train_aug.append(T.RandAugment(num_ops=2, magnitude=9))
+        train_aug += [
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        ]
+        # VMamba recipe: RandomErasing p=0.25 — CPU-side in worker, safe.
+        if getattr(flags, 'reprob', 0.0) > 0.0:
+            train_aug.append(T.RandomErasing(p=flags.reprob, scale=(0.02, 0.33)))
+        transform = T.Compose(train_aug)
     else:
         transform = T.Compose([
             T.Resize(int(flags.img_size * 1.14), interpolation=T.InterpolationMode.BICUBIC),
@@ -396,14 +443,22 @@ def build_tiny_loader(flags, is_training=True):
     ds = load_dataset("Maysee/tiny-imagenet")
 
     if is_training:
-        transform = T.Compose([
+        train_aug = [
             T.RandomResizedCrop(flags.img_size, scale=(0.3, 1.0), interpolation=T.InterpolationMode.BICUBIC),
             T.RandomHorizontalFlip(),
-            T.RandAugment(num_ops=2, magnitude=9),
-            T.ColorJitter(0.4, 0.4, 0.4),
+        ]
+        # VMamba recipe: RandAugment (opt-in via --randaug) — CPU-side, safe.
+        if getattr(flags, 'randaug', False):
+            train_aug.append(T.RandAugment(num_ops=2, magnitude=9))
+        train_aug.append(T.ColorJitter(0.4, 0.4, 0.4))
+        train_aug += [
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        ]
+        # VMamba recipe: RandomErasing p=0.25 — CPU-side in worker, safe.
+        if getattr(flags, 'reprob', 0.0) > 0.0:
+            train_aug.append(T.RandomErasing(p=flags.reprob, scale=(0.02, 0.33)))
+        transform = T.Compose(train_aug)
     else:
         transform = T.Compose([
             T.Resize(int(flags.img_size * 1.14), interpolation=T.InterpolationMode.BICUBIC),
@@ -484,6 +539,12 @@ def _mp_fn(index, flags):
         betas=(0.9, 0.999),
     )
     scheduler = build_lr_scheduler(optimizer, flags, scaled_lr)
+
+    # ── VMamba recipe: EMA — shadow model on TPU device, static graph ──
+    ema_decay = getattr(flags, 'ema_decay', 0.0)
+    ema = ModelEMA(model, decay=ema_decay) if ema_decay > 0.0 else None
+    if ema is not None:
+        xm.master_print(f"  EMA enabled (decay={ema_decay}) — static XLA graph, no recompile")
 
     start_epoch = 1
     best_acc = 0.0
@@ -582,6 +643,11 @@ def _mp_fn(index, flags):
             xm.reduce_gradients(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), flags.grad_clip)
             xm.optimizer_step(optimizer)
+
+            # ── EMA update (static blend graph, flushed with mark_step) ──
+            if ema is not None:
+                ema.update(model)
+
             tracker.add(flags.batch_size)
 
             total_loss += loss.item() * images.size(0)
@@ -599,6 +665,14 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
+        # ── Flush EMA updates before validation ────────────────────────
+        if ema is not None:
+            xm.mark_step()   # drain the EMA blend ops accumulated this epoch
+
+        # ── Always evaluate on LIVE model for logging ───────────────────
+        # EMA decay=0.9999 needs ~375K steps (ImageNet 300ep) to converge.
+        # On short runs the shadow is still near random-init → misleading
+        # val numbers. VMamba's actual practice: log live model, save EMA.
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -624,9 +698,11 @@ def _mp_fn(index, flags):
         )
 
         # ALL workers must evaluate this block to prevent XLA save-barriers from deadlocking!
+        # Save EMA weights as the primary checkpoint weights when EMA is active.
+        saved_sd = ema.state_dict() if ema is not None else model.state_dict()
         ckpt = {
             "epoch": epoch,
-            "state_dict": model.state_dict(),
+            "state_dict": saved_sd,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_acc": best_acc,

@@ -228,30 +228,11 @@ def triton_cs_mamba_forward(
         h_final : (B, N, D, S)
         h_saved : list of K tensors for backward
     """
-    B_val, N, D_dim, S_dim = h0.shape
-    dt = 1.0 / K
+    del x, B_mat
+    from triton_kernels.csma_triton_scan import cs_scan_forward_cuda
 
-    # Precompute BX = einsum('bnd,bns->bnds', x, B_mat) once
-    bx = torch.einsum('bnd,bns->bnds', x, B_mat)
-
-    # D_phys flat
-    d_phys_flat = D_phys.view(-1)  # (D,)
-
-    h = h0.clone().contiguous()
-    h_saved = []
-
-    for k in range(K):
-        h_saved.append(h.clone())
-
-        # 1. Collapse S, reshape to 2D, compute Laplacian
-        h_collapsed = h.sum(dim=-1)                              # (B, N, D)
-        h_2d = h_collapsed.transpose(1, 2).reshape(B_val, D_dim, H, W).contiguous()
-        lap_h = triton_laplacian_neumann(h_2d)                   # (B, D, H, W)
-
-        # 2. Fused Euler step (in-place)
-        triton_euler_step(h, lap_h, delta_s, delta_d, A, bx, d_phys_flat, dt, H, W)
-
-    return h, h_saved
+    h, states = cs_scan_forward_cuda(h0, delta_s, delta_d, A, D_phys, K, H, W)
+    return h, [states[i] for i in range(K)]
 
 
 # ── Validation against PyTorch reference ──────────────────────

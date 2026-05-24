@@ -61,6 +61,7 @@ class CrossScanSS2D(nn.Module):
         self.route_scale = nn.Parameter(torch.ones(self.n_routes, 1, 1, d_inner))
         self.out_norm = nn.LayerNorm(d_inner)
         self.D = nn.Parameter(torch.ones(d_inner))
+        self.use_triton = True
 
         # softplus(-1.5) ~= 0.20, exp(-0.20) ~= 0.82 retain.
         nn.init.constant_(self.delta_proj.bias, -1.5)
@@ -74,11 +75,16 @@ class CrossScanSS2D(nn.Module):
         retain = torch.exp(-delta)
         inject = 1.0 - retain
         values = self.value_proj(seq) * self.route_scale[route_idx]
+        updates = inject * values
+
+        if self.use_triton and seq.is_cuda:
+            from triton_kernels.vmamba4d_triton_scan import selective_scan_cuda
+            return selective_scan_cuda(retain, updates)
 
         states = []
-        h = torch.zeros_like(values[:, 0])
-        for t in range(values.shape[1]):
-            h = retain[:, t] * h + inject[:, t] * values[:, t]
+        h = torch.zeros_like(updates[:, 0])
+        for t in range(updates.shape[1]):
+            h = retain[:, t] * h + updates[:, t]
             states.append(h)
         return torch.stack(states, dim=1)
 

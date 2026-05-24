@@ -1,11 +1,7 @@
-"""
-CS-Mamba PDE Solver — autograd.Function Wrapper (Part 5)
-========================================================
-Uses the PyTorch reference forward for now. When Triton kernels are validated,
-the forward/backward calls get swapped to Triton while the API stays identical.
+"""CS-Mamba PDE solver autograd wrapper.
 
-Usage:
-    h_final = cs_scan(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W)
+CUDA tensors use the Triton forward/backward implementation. CPU and XLA
+tensors keep the PyTorch reference path so the TPU trainer remains unchanged.
 """
 
 import torch
@@ -95,7 +91,10 @@ class CSScanFunction(torch.autograd.Function):
 
 
 def cs_scan(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W):
-    """Convenience wrapper."""
+    """Convenience wrapper with CUDA/Triton dispatch."""
+    if h0.is_cuda:
+        from triton_kernels.csma_triton_scan import cs_scan_cuda
+        return cs_scan_cuda(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W)
     return CSScanFunction.apply(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W)
 
 
