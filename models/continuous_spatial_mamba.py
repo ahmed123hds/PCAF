@@ -20,6 +20,13 @@ def cs_mamba_forward_reference(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, 
     B_val, N, D_dim, S_dim = h0.shape
     dt = 1.0 / K
     h = h0.clone()
+
+    # These terms are constant across Euler steps. Keeping them outside the
+    # recurrence reduces repeated einsum/broadcast work without changing math.
+    mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)
+    self_coeff = 1.0 + dt * delta_s.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+    input_term = dt * delta_s.unsqueeze(-1) * mamba_input
+    diff_coeff = dt * delta_d.unsqueeze(-1) * D_phys.view(1, 1, -1, 1)
     
     for k in range(K):
         h_collapsed = h.sum(dim=-1)
@@ -27,15 +34,8 @@ def cs_mamba_forward_reference(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, 
         lap_h_2d = laplacian_2d_neumann(h_2d)
         lap_h = lap_h_2d.reshape(B_val, D_dim, N).transpose(1, 2)
         diffused = lap_h.unsqueeze(-1)
-        
-        mamba_decay = A.unsqueeze(0).unsqueeze(0) * h
-        mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)
-        force_1 = delta_s.unsqueeze(-1) * (mamba_decay + mamba_input)
-        
-        D_coeff = D_phys.view(1, 1, -1, 1)
-        force_2 = delta_d.unsqueeze(-1) * D_coeff * diffused
-        
-        h = h + dt * (force_1 + force_2)
+
+        h = h * self_coeff + input_term + diff_coeff * diffused
     return h, None
 
 _compiled_cs_mamba_loop = None
