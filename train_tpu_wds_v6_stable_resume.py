@@ -48,6 +48,7 @@ import webdataset as wds
 
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba_V1
 from models.characteristic_mamba_v6 import CSMamba_V6
+from models.vmamba_4d import VMamba4D
 
 
 @dataclass
@@ -141,7 +142,7 @@ def parse_args():
     p.add_argument("--val_shards", type=str, default="")
 
     # Model
-    p.add_argument("--model_version", choices=["v1", "v6"], default="v6")
+    p.add_argument("--model_version", choices=["v1", "v6", "vmamba"], default="v6")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--patch_size", type=int, default=16)
     p.add_argument("--d_embed", type=int, default=512)
@@ -464,6 +465,9 @@ def _mp_fn(index, flags):
     if flags.model_version == "v1":
         model = CSMamba_V1(cfg).to(device)
         model_name = "CS-Mamba V1 (Continuous Spatial)"
+    elif flags.model_version == "vmamba":
+        model = VMamba4D(cfg).to(device)
+        model_name = "VMamba4D (TPU-safe Cross-Scan)"
     else:
         model = CSMamba_V6(cfg).to(device)
         model_name = "CS-Mamba V6 (Characteristic Mamba)"
