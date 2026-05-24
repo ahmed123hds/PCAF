@@ -19,24 +19,24 @@ def laplacian_2d_neumann(h_2d: torch.Tensor) -> torch.Tensor:
 def cs_mamba_forward_reference(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W):
     B_val, N, D_dim, S_dim = h0.shape
     dt = 1.0 / K
-    h = h0.clone()
+    h = h0.permute(0, 2, 1, 3).unflatten(2, (H, W))
 
     # These terms are constant across Euler steps. Keeping them outside the
     # recurrence reduces repeated einsum/broadcast work without changing math.
-    mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)
-    self_coeff = 1.0 + dt * delta_s.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
-    input_term = dt * delta_s.unsqueeze(-1) * mamba_input
-    diff_coeff = dt * delta_d.unsqueeze(-1) * D_phys.view(1, 1, -1, 1)
+    delta_s_spatial = delta_s.permute(0, 2, 1).unflatten(2, (H, W)).unsqueeze(-1)
+    delta_d_spatial = delta_d.permute(0, 2, 1).unflatten(2, (H, W)).unsqueeze(-1)
+
+    # h0 is exactly x ⊗ B_mat; the SSM input term uses the same tensor.
+    mamba_input = h
+    self_coeff = 1.0 + dt * delta_s_spatial * A.view(1, D_dim, 1, 1, S_dim)
+    input_term = dt * delta_s_spatial * mamba_input
+    diff_coeff = dt * delta_d_spatial * D_phys.view(1, D_dim, 1, 1, 1)
     
     for k in range(K):
-        h_collapsed = h.sum(dim=-1)
-        h_2d = h_collapsed.transpose(1, 2).reshape(B_val, D_dim, H, W)
-        lap_h_2d = laplacian_2d_neumann(h_2d)
-        lap_h = lap_h_2d.reshape(B_val, D_dim, N).transpose(1, 2)
-        diffused = lap_h.unsqueeze(-1)
+        diffused = laplacian_2d_neumann(h.sum(dim=-1)).unsqueeze(-1)
 
         h = h * self_coeff + input_term + diff_coeff * diffused
-    return h, None
+    return h.flatten(2, 3).permute(0, 2, 1, 3), None
 
 _compiled_cs_mamba_loop = None
 
@@ -144,7 +144,7 @@ class ContinuousSpatialSSM(nn.Module):
             h = compiled_loop(h0, x, delta_self, delta_diff, A_mat, B_mat, D_phys, K_steps, H, W)
 
         # 5. Output Projection: y(T) = C * h(T) + D * x
-        y = torch.einsum('bnds,bns->bnd', h, C_mat)
+        y = torch.matmul(h, C_mat.unsqueeze(-1)).squeeze(-1)
         y = y + x * self.D
         return y
 
