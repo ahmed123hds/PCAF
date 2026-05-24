@@ -106,6 +106,7 @@ from models.mamba_simple       import MambaClassifier
 from models.neural_ode_router  import NeuralODERouter, FixedRouterHilbert
 from models.continuous_graph_mamba import ContinuousGraphMambaClassifier as CGMamba
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba
+from models.continuous_spatial_mamba_v1_2 import ContinuousSpatialMambaClassifier_V12 as CSMamba_V12
 from models.vmamba_4d import VMamba4D
 
 
@@ -176,6 +177,18 @@ class CSMambaCIFAR(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.model = CSMamba(cfg)
+        self.use_triton = cfg.use_triton
+
+    def forward(self, x):
+        return self.model(x, use_triton=self.use_triton)
+
+
+class CSMambaV12CIFAR(nn.Module):
+    """CS-Mamba V1.2 wrapper that enables the CUDA/Triton 3D-state scan."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.model = CSMamba_V12(cfg)
         self.use_triton = cfg.use_triton
 
     def forward(self, x):
@@ -388,7 +401,10 @@ def parse_args():
         description="Routing Hypothesis Experiment on CIFAR-10"
     )
     # What to run
-    p.add_argument('--mode', choices=['hilbert', 'ode', 'graph_ode', 'spatial', 'vmamba', 'spatial_vmamba', 'all'],
+    p.add_argument('--mode', choices=[
+        'hilbert', 'ode', 'graph_ode', 'spatial', 'spatial_v12',
+        'vmamba', 'spatial_vmamba', 'spatial_v12_vmamba', 'all'
+    ],
                    default='all', help="Which model(s) to train")
 
     # Data
@@ -483,7 +499,12 @@ def main():
         model_s = CSMambaCIFAR(cfg).to(device)
         results['CSMamba'] = train_model('CSMamba', model_s, cfg, device)
 
-    if cfg.mode in ('vmamba', 'spatial_vmamba', 'all'):
+    if cfg.mode in ('spatial_v12', 'spatial_v12_vmamba'):
+        setattr(cfg, 'canvas_size', cfg.img_size) # for compatibility
+        model_s12 = CSMambaV12CIFAR(cfg).to(device)
+        results['CSMamba_V1_2'] = train_model('CSMamba_V1_2', model_s12, cfg, device)
+
+    if cfg.mode in ('vmamba', 'spatial_vmamba', 'spatial_v12_vmamba', 'all'):
         model_v = VMamba4D(cfg).to(device)
         results['VMamba4D'] = train_model('VMamba4D', model_v, cfg, device)
 

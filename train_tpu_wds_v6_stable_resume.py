@@ -48,6 +48,7 @@ import torchvision.transforms as T
 import webdataset as wds
 
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba_V1
+from models.continuous_spatial_mamba_v1_2 import ContinuousSpatialMambaClassifier_V12 as CSMamba_V12
 from models.characteristic_mamba_v6 import CSMamba_V6
 from models.vmamba_4d import VMamba4D
 
@@ -143,7 +144,7 @@ def parse_args():
     p.add_argument("--val_shards", type=str, default="")
 
     # Model
-    p.add_argument("--model_version", choices=["v1", "v6", "vmamba"], default="v6")
+    p.add_argument("--model_version", choices=["v1", "v1_2", "v6", "vmamba"], default="v6")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--patch_size", type=int, default=16)
     p.add_argument("--d_embed", type=int, default=512)
@@ -191,6 +192,7 @@ def parse_args():
     p.add_argument("--device_prefetch_size", type=int, default=1, help="Device-side PyTorch/XLA MpDeviceLoader queue size")
     p.add_argument("--host_to_device_transfer_threads", type=int, default=1, help="Host-to-device transfer threads used by MpDeviceLoader")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--xla_metrics_every", type=int, default=0, help="Print selected cumulative XLA metrics every N epochs; 0 disables")
 
     return p.parse_args()
 
@@ -493,6 +495,53 @@ def _maybe_autocast(flags):
     return torch.autocast(device_type="xla", enabled=False)
 
 
+def _print_xla_metrics(tag):
+    """Print a compact subset of cumulative XLA metrics for compile diagnosis."""
+    try:
+        import torch_xla.core.xla_model as xm
+        import torch_xla.debug.metrics as met
+        report = met.metrics_report()
+    except Exception as exc:
+        try:
+            xm.master_print(f"[xla-metrics:{tag}] unavailable: {exc}")
+        except Exception:
+            print(f"[xla-metrics:{tag}] unavailable: {exc}")
+        return
+
+    wanted = {
+        "CompileTime",
+        "ExecuteTime",
+        "MarkStep",
+        "CachedCompile",
+        "CreateCompileHandles",
+        "CompileCacheMiss",
+        "UncachedCompile",
+    }
+    lines = report.splitlines()
+    selected = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(("Metric: ", "Counter: ")):
+            name = line.split(":", 1)[1].strip()
+            if name in wanted:
+                selected.append(line.strip())
+                j = i + 1
+                while j < len(lines) and not lines[j].startswith(("Metric: ", "Counter: ")):
+                    text = lines[j].strip()
+                    if text.startswith(("TotalSamples:", "Value:", "Rate:", "Accumulator:", "Percentiles:")):
+                        selected.append("  " + text)
+                    j += 1
+                i = j
+                continue
+        i += 1
+
+    if selected:
+        xm.master_print(f"[xla-metrics:{tag}]\n" + "\n".join(selected))
+    else:
+        xm.master_print(f"[xla-metrics:{tag}] no selected metrics found")
+
+
 def _mp_fn(index, flags):
     _set_parent_death_signal()
     _ensure_forkserver_started()
@@ -520,6 +569,9 @@ def _mp_fn(index, flags):
     if flags.model_version == "v1":
         model = CSMamba_V1(cfg).to(device)
         model_name = "CS-Mamba V1 (Continuous Spatial)"
+    elif flags.model_version == "v1_2":
+        model = CSMamba_V12(cfg).to(device)
+        model_name = "CS-Mamba V1.2 (3D Continuous Spatial)"
     elif flags.model_version == "vmamba":
         model = VMamba4D(cfg).to(device)
         model_name = "VMamba4D (TPU-safe Cross-Scan)"
@@ -694,6 +746,8 @@ def _mp_fn(index, flags):
             f"Train {g_acc:.1f}% (loss {g_loss:.4f}) | Val {v_acc:.1f}% | "
             f"Train {train_time:.0f}s | Val {val_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e}\n"
         )
+        if flags.xla_metrics_every > 0 and epoch % flags.xla_metrics_every == 0:
+            _print_xla_metrics(f"epoch-{epoch:03d}")
 
         # ALL workers must evaluate this block to prevent XLA save-barriers from deadlocking!
         # Always save LIVE model weights — EMA shadow is XLA device memory that gets

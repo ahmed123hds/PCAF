@@ -18,6 +18,7 @@ from models.continuous_spatial_mamba import cs_mamba_forward_reference
 from models.continuous_spatial_mamba import ContinuousSpatialSSM
 from models.vmamba_4d import CrossScanSS2D
 from triton_kernels.csma_autograd import cs_scan
+from triton_kernels.csma_triton_scan import cs_scan_forward_cuda, grid_neighbor_index
 from triton_kernels.vmamba4d_triton_scan import selective_scan_cuda
 
 
@@ -83,6 +84,25 @@ def csma_correctness(args) -> None:
         ("grad_D_phys", tri_grads[6], ref_grads[6]),
     ]:
         assert_close(name, tri_grad, ref_grad, atol=args.grad_atol, rtol=args.grad_rtol)
+
+    neighbors = grid_neighbor_index(args.h_grid, args.w_grid, h0.device)
+    assert tuple(neighbors.shape) == (args.h_grid * args.w_grid, 4)
+    assert int(neighbors[0, 0].item()) == 0
+    assert int(neighbors[0, 2].item()) == 0
+    assert int(neighbors[-1, 1].item()) == args.h_grid * args.w_grid - 1
+    assert int(neighbors[-1, 3].item()) == args.h_grid * args.w_grid - 1
+    h_tri_custom, _ = cs_scan_forward_cuda(
+        h0.detach(),
+        ds.detach(),
+        dd.detach(),
+        A.detach(),
+        dp.detach(),
+        args.k_steps,
+        args.h_grid,
+        args.w_grid,
+        neighbor_index=neighbors,
+    )
+    assert_close("forward_custom_neighbor_index", h_tri_custom, h_ref.detach(), atol=args.atol, rtol=args.rtol)
 
 
 def vmamba_reference_scan(retain: torch.Tensor, update: torch.Tensor) -> torch.Tensor:

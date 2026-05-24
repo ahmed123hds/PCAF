@@ -33,6 +33,34 @@ def _require_triton_cuda(*tensors: torch.Tensor) -> None:
         raise RuntimeError("The Triton CS-Mamba scan requires CUDA tensors.")
 
 
+_NEIGHBOR_INDEX_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def grid_neighbor_index(H: int, W: int, device: torch.device | str) -> torch.Tensor:
+    """Return flat-grid Neumann neighbor indices with columns [top, bottom, left, right]."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError("grid_neighbor_index is only used by CUDA/Triton kernels.")
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (int(device_index), int(H), int(W))
+    cached = _NEIGHBOR_INDEX_CACHE.get(key)
+    if cached is not None and cached.device.index == device_index:
+        return cached
+
+    with torch.cuda.device(device_index):
+        n_tokens = int(H) * int(W)
+        idx = torch.arange(n_tokens, device=device, dtype=torch.int64)
+        row = idx // int(W)
+        col = idx - row * int(W)
+        top = torch.where(row > 0, idx - int(W), idx)
+        bottom = torch.where(row < int(H) - 1, idx + int(W), idx)
+        left = torch.where(col > 0, idx - 1, idx)
+        right = torch.where(col < int(W) - 1, idx + 1, idx)
+        neighbors = torch.stack((top, bottom, left, right), dim=1).contiguous()
+    _NEIGHBOR_INDEX_CACHE[key] = neighbors
+    return neighbors
+
+
 @triton.jit
 def _csma_forward_step_kernel(
     H_PTR,
@@ -41,6 +69,7 @@ def _csma_forward_step_kernel(
     DD_PTR,
     A_PTR,
     DPHYS_PTR,
+    NEIGHBOR_PTR,
     OUT_PTR,
     SAVE_PTR,
     DT: tl.constexpr,
@@ -49,8 +78,6 @@ def _csma_forward_step_kernel(
     N: tl.constexpr,
     D: tl.constexpr,
     S: tl.constexpr,
-    H_GRID: tl.constexpr,
-    W_GRID: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
@@ -63,12 +90,10 @@ def _csma_forward_step_kernel(
     mask_ds = (d[:, None] < D) & (s[None, :] < S)
     mask_d = d < D
 
-    row = n // W_GRID
-    col = n - row * W_GRID
-    n_top = tl.where(row > 0, n - W_GRID, n)
-    n_bot = tl.where(row < H_GRID - 1, n + W_GRID, n)
-    n_left = tl.where(col > 0, n - 1, n)
-    n_right = tl.where(col < W_GRID - 1, n + 1, n)
+    n_top = tl.load(NEIGHBOR_PTR + n * 4 + 0)
+    n_bot = tl.load(NEIGHBOR_PTR + n * 4 + 1)
+    n_left = tl.load(NEIGHBOR_PTR + n * 4 + 2)
+    n_right = tl.load(NEIGHBOR_PTR + n * 4 + 3)
 
     base = ((b * N + n) * D + d[:, None]) * S + s[None, :]
     top_base = ((b * N + n_top) * D + d[:, None]) * S + s[None, :]
@@ -109,6 +134,7 @@ def _csma_backward_step_kernel(
     DD_PTR,
     A_PTR,
     DPHYS_PTR,
+    NEIGHBOR_PTR,
     G_PREV_PTR,
     GH0_ACC_PTR,
     GDS_PTR,
@@ -120,8 +146,6 @@ def _csma_backward_step_kernel(
     N: tl.constexpr,
     D: tl.constexpr,
     S: tl.constexpr,
-    H_GRID: tl.constexpr,
-    W_GRID: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
@@ -134,12 +158,10 @@ def _csma_backward_step_kernel(
     mask_ds = (d[:, None] < D) & (s[None, :] < S)
     mask_d = d < D
 
-    row = n // W_GRID
-    col = n - row * W_GRID
-    n_top = tl.where(row > 0, n - W_GRID, n)
-    n_bot = tl.where(row < H_GRID - 1, n + W_GRID, n)
-    n_left = tl.where(col > 0, n - 1, n)
-    n_right = tl.where(col < W_GRID - 1, n + 1, n)
+    n_top = tl.load(NEIGHBOR_PTR + n * 4 + 0)
+    n_bot = tl.load(NEIGHBOR_PTR + n * 4 + 1)
+    n_left = tl.load(NEIGHBOR_PTR + n * 4 + 2)
+    n_right = tl.load(NEIGHBOR_PTR + n * 4 + 3)
 
     base = ((b * N + n) * D + d[:, None]) * S + s[None, :]
     top_base = ((b * N + n_top) * D + d[:, None]) * S + s[None, :]
@@ -242,6 +264,7 @@ def cs_scan_forward_cuda(
     H: int,
     W: int,
     *,
+    neighbor_index: torch.Tensor | None = None,
     block_d: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return final h and saved pre-step states for the custom backward."""
@@ -260,6 +283,13 @@ def cs_scan_forward_cuda(
         raise ValueError(f"A shape {tuple(A.shape)} does not match {(d_dim, s_dim)}.")
     if D_phys_flat.numel() != d_dim:
         raise ValueError(f"D_phys has {D_phys_flat.numel()} values, expected {d_dim}.")
+    if neighbor_index is None:
+        neighbor_index = grid_neighbor_index(H, W, h0.device)
+    else:
+        _require_triton_cuda(neighbor_index)
+        neighbor_index = neighbor_index.contiguous()
+        if tuple(neighbor_index.shape) != (n_tokens, 4):
+            raise ValueError(f"neighbor_index shape {tuple(neighbor_index.shape)} must be {(n_tokens, 4)}.")
 
     h = h0.contiguous()
     work_a = torch.empty_like(h)
@@ -278,6 +308,7 @@ def cs_scan_forward_cuda(
             delta_d,
             A,
             D_phys_flat,
+            neighbor_index,
             h_next,
             states,
             DT=dt,
@@ -286,8 +317,6 @@ def cs_scan_forward_cuda(
             N=n_tokens,
             D=d_dim,
             S=s_dim,
-            H_GRID=H,
-            W_GRID=W,
             BLOCK_D=block_d,
             BLOCK_S=block_s,
             num_warps=4,
@@ -309,6 +338,7 @@ def cs_scan_backward_cuda(
     H: int,
     W: int,
     *,
+    neighbor_index: torch.Tensor | None = None,
     block_d: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _require_triton_cuda(grad_output, states, h0, delta_s, delta_d, A, D_phys)
@@ -321,6 +351,14 @@ def cs_scan_backward_cuda(
     D_phys_flat = D_phys.contiguous().view(-1)
 
     bsz, n_tokens, d_dim, s_dim = h0.shape
+    if neighbor_index is None:
+        neighbor_index = grid_neighbor_index(H, W, h0.device)
+    else:
+        _require_triton_cuda(neighbor_index)
+        neighbor_index = neighbor_index.contiguous()
+        if tuple(neighbor_index.shape) != (n_tokens, 4):
+            raise ValueError(f"neighbor_index shape {tuple(neighbor_index.shape)} must be {(n_tokens, 4)}.")
+
     g = grad_output
     g_prev = torch.empty_like(g)
     grad_h0_input = torch.zeros_like(h0)
@@ -343,6 +381,7 @@ def cs_scan_backward_cuda(
             delta_d,
             A,
             D_phys_flat,
+            neighbor_index,
             g_prev,
             grad_h0_input,
             grad_delta_s,
@@ -354,8 +393,6 @@ def cs_scan_backward_cuda(
             N=n_tokens,
             D=d_dim,
             S=s_dim,
-            H_GRID=H,
-            W_GRID=W,
             BLOCK_D=block_d,
             BLOCK_S=block_s,
             num_warps=4,
