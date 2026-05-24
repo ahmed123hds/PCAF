@@ -46,6 +46,7 @@ import torch.optim as optim
 import torchvision.transforms as T
 import webdataset as wds
 
+from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba_V1
 from models.characteristic_mamba_v6 import CSMamba_V6
 
 
@@ -140,9 +141,11 @@ def parse_args():
     p.add_argument("--val_shards", type=str, default="")
 
     # Model
+    p.add_argument("--model_version", choices=["v1", "v6"], default="v6")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--patch_size", type=int, default=16)
     p.add_argument("--d_embed", type=int, default=512)
+    p.add_argument("--d_state", type=int, default=16)
     p.add_argument("--n_mamba_layers", type=int, default=8)
     p.add_argument("--K_steps", type=int, default=4)
     p.add_argument("--n_classes", type=int, default=1000)
@@ -450,6 +453,7 @@ def _mp_fn(index, flags):
     cfg.img_size = flags.img_size
     cfg.patch_size = flags.patch_size
     cfg.d_embed = flags.d_embed
+    cfg.d_state = flags.d_state
     cfg.n_mamba_layers = flags.n_mamba_layers
     cfg.K_steps = flags.K_steps
     cfg.n_classes = flags.n_classes
@@ -457,7 +461,12 @@ def _mp_fn(index, flags):
     cfg.drop_path = flags.drop_path
     cfg.n_flow_groups = flags.n_flow_groups
 
-    model = CSMamba_V6(cfg).to(device)
+    if flags.model_version == "v1":
+        model = CSMamba_V1(cfg).to(device)
+        model_name = "CS-Mamba V1 (Continuous Spatial)"
+    else:
+        model = CSMamba_V6(cfg).to(device)
+        model_name = "CS-Mamba V6 (Characteristic Mamba)"
 
     world_size = xm.xrt_world_size()
     global_bs = flags.batch_size * world_size
@@ -510,7 +519,7 @@ def _mp_fn(index, flags):
 
     n_params = sum(p.numel() for p in model.parameters())
     xm.master_print(f"\n{'='*72}")
-    xm.master_print(f"CS-Mamba V6 (Characteristic Mamba) | Params: {n_params/1e6:.1f}M")
+    xm.master_print(f"{model_name} | Params: {n_params/1e6:.1f}M")
     xm.master_print(f"World Size: {world_size} TPU cores | Global BS: {global_bs}")
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     print(f"Actual optimizer LR now: {optimizer.param_groups[0]['lr']:.6f}")
