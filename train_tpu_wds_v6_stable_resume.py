@@ -153,6 +153,8 @@ def parse_args():
     p.add_argument("--K_steps", type=int, default=4)
     p.add_argument("--n_classes", type=int, default=1000)
     p.add_argument("--drop_path", type=float, default=0.1)
+    p.add_argument("--spatial_op", choices=["laplacian", "conv2d", "conv1d"], default="laplacian",
+                   help="V1.2 spatial operator ablation")
     p.add_argument("--n_flow_groups", type=int, default=8, help="Number of flow groups for transport")
 
     # Optimizer
@@ -564,6 +566,7 @@ def _mp_fn(index, flags):
     cfg.n_classes = flags.n_classes
     cfg.canvas_size = flags.img_size
     cfg.drop_path = flags.drop_path
+    cfg.spatial_op = flags.spatial_op
     cfg.n_flow_groups = flags.n_flow_groups
 
     if flags.model_version == "v1":
@@ -571,7 +574,7 @@ def _mp_fn(index, flags):
         model_name = "CS-Mamba V1 (Continuous Spatial)"
     elif flags.model_version == "v1_2":
         model = CSMamba_V12(cfg).to(device)
-        model_name = "CS-Mamba V1.2 (3D Continuous Spatial)"
+        model_name = f"CS-Mamba V1.2 ({flags.spatial_op} 3D Continuous Spatial)"
     elif flags.model_version == "vmamba":
         model = VMamba4D(cfg).to(device)
         model_name = "VMamba4D (TPU-safe Cross-Scan)"

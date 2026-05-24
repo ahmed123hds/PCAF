@@ -434,6 +434,9 @@ def parse_args():
     p.add_argument('--K_steps',    type=int,   default=3,
                    help="Discrete Euler steps defining forward diffusion time")
     p.add_argument('--drop_path',  type=float, default=0.1)
+    p.add_argument('--spatial_op', default='laplacian',
+                   choices=['laplacian', 'conv2d', 'conv1d'],
+                   help="V1.2 spatial operator ablation")
     p.add_argument('--use_triton', action='store_true',
                    help="Use custom CUDA/Triton scan kernels for supported models")
     p.add_argument('--compile', action='store_true',
@@ -502,7 +505,8 @@ def main():
     if cfg.mode in ('spatial_v12', 'spatial_v12_vmamba'):
         setattr(cfg, 'canvas_size', cfg.img_size) # for compatibility
         model_s12 = CSMambaV12CIFAR(cfg).to(device)
-        results['CSMamba_V1_2'] = train_model('CSMamba_V1_2', model_s12, cfg, device)
+        v12_name = f"CSMamba_V1_2_{cfg.spatial_op}"
+        results[v12_name] = train_model(v12_name, model_s12, cfg, device)
 
     if cfg.mode in ('vmamba', 'spatial_vmamba', 'spatial_v12_vmamba', 'all'):
         model_v = VMamba4D(cfg).to(device)

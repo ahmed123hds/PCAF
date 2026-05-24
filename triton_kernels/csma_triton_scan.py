@@ -15,6 +15,8 @@ loading only the four spatial neighbors needed by the Neumann Laplacian.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -254,6 +256,68 @@ def _block_s(s_dim: int) -> int:
     return max(16, triton.next_power_of_2(s_dim))
 
 
+@triton.jit
+def _csma_forward_s16_step_kernel(
+    H_PTR,
+    H0_PTR,
+    DS_PTR,
+    DD_PTR,
+    A_PTR,
+    DPHYS_PTR,
+    NEIGHBOR_PTR,
+    OUT_PTR,
+    SAVE_PTR,
+    DT: tl.constexpr,
+    STEP: tl.constexpr,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    s = tl.arange(0, 16)
+    mask_d = d < D
+    mask_ds = (d[:, None] < D) & (s[None, :] < 16)
+
+    n_top = tl.load(NEIGHBOR_PTR + n * 4 + 0)
+    n_bot = tl.load(NEIGHBOR_PTR + n * 4 + 1)
+    n_left = tl.load(NEIGHBOR_PTR + n * 4 + 2)
+    n_right = tl.load(NEIGHBOR_PTR + n * 4 + 3)
+
+    base = ((b * N + n) * D + d[:, None]) * 16 + s[None, :]
+    top_base = ((b * N + n_top) * D + d[:, None]) * 16 + s[None, :]
+    bot_base = ((b * N + n_bot) * D + d[:, None]) * 16 + s[None, :]
+    left_base = ((b * N + n_left) * D + d[:, None]) * 16 + s[None, :]
+    right_base = ((b * N + n_right) * D + d[:, None]) * 16 + s[None, :]
+
+    h = tl.load(H_PTR + base, mask=mask_ds, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask_ds, other=0.0).to(tl.float32)
+    top = tl.load(H_PTR + top_base, mask=mask_ds, other=0.0).to(tl.float32)
+    bot = tl.load(H_PTR + bot_base, mask=mask_ds, other=0.0).to(tl.float32)
+    left = tl.load(H_PTR + left_base, mask=mask_ds, other=0.0).to(tl.float32)
+    right = tl.load(H_PTR + right_base, mask=mask_ds, other=0.0).to(tl.float32)
+
+    q = tl.sum(h, axis=1)
+    lap = tl.sum(top, axis=1) + tl.sum(bot, axis=1) + tl.sum(left, axis=1) + tl.sum(right, axis=1) - 4.0 * q
+
+    bnd = (b * N + n) * D + d
+    ds = tl.load(DS_PTR + bnd, mask=mask_d, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + bnd, mask=mask_d, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask_d, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d[:, None] * 16 + s[None, :], mask=mask_ds, other=0.0).to(tl.float32)
+
+    out = h * (1.0 + DT * ds[:, None] * a)
+    out += DT * ds[:, None] * h0
+    out += DT * dd[:, None] * dphys[:, None] * lap[:, None]
+
+    tl.store(OUT_PTR + base, out, mask=mask_ds)
+    tl.store(SAVE_PTR + STEP * B * N * D * 16 + base, h, mask=mask_ds)
+
+
 def cs_scan_forward_cuda(
     h0: torch.Tensor,
     delta_s: torch.Tensor,
@@ -319,6 +383,76 @@ def cs_scan_forward_cuda(
             S=s_dim,
             BLOCK_D=block_d,
             BLOCK_S=block_s,
+            num_warps=4,
+        )
+        h = h_next
+
+    return h, states
+
+
+def cs_scan_forward_s16_cuda(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    neighbor_index: torch.Tensor | None = None,
+    block_d: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
+    if not h0.is_contiguous():
+        h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim, s_dim = h0.shape
+    if s_dim != 16:
+        raise ValueError(f"cs_scan_forward_s16_cuda requires S=16, got S={s_dim}.")
+    if n_tokens != H * W:
+        raise ValueError(f"H*W={H * W} does not match N={n_tokens}.")
+    if A.shape != (d_dim, 16):
+        raise ValueError(f"A shape {tuple(A.shape)} does not match {(d_dim, 16)}.")
+    if D_phys_flat.numel() != d_dim:
+        raise ValueError(f"D_phys has {D_phys_flat.numel()} values, expected {d_dim}.")
+    if neighbor_index is None:
+        neighbor_index = grid_neighbor_index(H, W, h0.device)
+    else:
+        _require_triton_cuda(neighbor_index)
+        neighbor_index = neighbor_index.contiguous()
+        if tuple(neighbor_index.shape) != (n_tokens, 4):
+            raise ValueError(f"neighbor_index shape {tuple(neighbor_index.shape)} must be {(n_tokens, 4)}.")
+
+    h = h0.contiguous()
+    work_a = torch.empty_like(h)
+    work_b = torch.empty_like(h)
+    states = torch.empty((K, bsz, n_tokens, d_dim, 16), device=h.device, dtype=h.dtype)
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+
+    for step in range(K):
+        h_next = work_a if step % 2 == 0 else work_b
+        _csma_forward_s16_step_kernel[grid](
+            h,
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys_flat,
+            neighbor_index,
+            h_next,
+            states,
+            DT=dt,
+            STEP=step,
+            B=bsz,
+            N=n_tokens,
+            D=d_dim,
+            BLOCK_D=block_d,
             num_warps=4,
         )
         h = h_next
@@ -417,7 +551,11 @@ class CSTritonScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W):
         del x, B_mat
-        h, states = cs_scan_forward_cuda(h0, delta_s, delta_d, A, D_phys, int(K), int(H), int(W))
+        use_s16 = h0.shape[-1] == 16 and os.environ.get("CS_MAMBA_USE_S16_FORWARD") == "1"
+        if use_s16:
+            h, states = cs_scan_forward_s16_cuda(h0, delta_s, delta_d, A, D_phys, int(K), int(H), int(W))
+        else:
+            h, states = cs_scan_forward_cuda(h0, delta_s, delta_d, A, D_phys, int(K), int(H), int(W))
         ctx.save_for_backward(states, h0, delta_s, delta_d, A, D_phys)
         ctx.K = int(K)
         ctx.H = int(H)
