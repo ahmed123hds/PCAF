@@ -213,6 +213,30 @@ class AddGaussianNoise(object):
             return tensor + torch.randn(tensor.size()) * self.std + self.mean
         return tensor
 
+class HFTinyImageNetDataset(torch.utils.data.Dataset):
+    def __init__(self, split: str, transform):
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "Tiny-ImageNet local path was not found and Hugging Face "
+                "datasets is not installed. Run: pip install datasets"
+            ) from exc
+
+        self.ds = load_dataset("zh-plus/tiny-imagenet", split=split)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]
+        image = sample["image"].convert("RGB")
+        label = int(sample["label"])
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
 def prepare_tiny_imagenet_val(data_dir: str) -> str:
     val_dir = os.path.join(data_dir, "val")
     imagefolder_val = os.path.join(data_dir, "val_imagefolder")
@@ -274,8 +298,14 @@ def get_dataloaders(cfg):
     ])
 
     if is_tiny:
-        train_ds = torchvision.datasets.ImageFolder(os.path.join(cfg.data_dir, "train"), transform=train_tf)
-        val_ds = torchvision.datasets.ImageFolder(prepare_tiny_imagenet_val(cfg.data_dir), transform=val_tf)
+        train_dir = os.path.join(cfg.data_dir, "train")
+        if os.path.isdir(train_dir):
+            train_ds = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
+            val_ds = torchvision.datasets.ImageFolder(prepare_tiny_imagenet_val(cfg.data_dir), transform=val_tf)
+        else:
+            print(f"Tiny-ImageNet path not found at {train_dir}; loading zh-plus/tiny-imagenet via datasets.")
+            train_ds = HFTinyImageNetDataset("train", transform=train_tf)
+            val_ds = HFTinyImageNetDataset("valid", transform=val_tf)
     else:
         dataset_cls = torchvision.datasets.CIFAR100 if cfg.dataset == 'cifar100' else torchvision.datasets.CIFAR10
         train_ds = dataset_cls(
