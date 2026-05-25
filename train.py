@@ -103,7 +103,6 @@ def mixup_criterion(criterion, logits, y_a, y_b, lam):
     return lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
 
 from models.patch_encoder      import PatchEmbedding
-from models.mamba_simple       import MambaClassifier
 from models.neural_ode_router  import NeuralODERouter, FixedRouterHilbert
 from models.continuous_graph_mamba import ContinuousGraphMambaClassifier as CGMamba
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba
@@ -120,6 +119,8 @@ class HilbertMamba(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
+        from models.mamba_simple import MambaClassifier
+
         self.embedder = PatchEmbedding(
             img_size=cfg.img_size,
             patch_size=cfg.patch_size,
@@ -146,6 +147,8 @@ class ODEMamba(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
+        from models.mamba_simple import MambaClassifier
+
         self.embedder = PatchEmbedding(
             img_size=cfg.img_size,
             patch_size=cfg.patch_size,

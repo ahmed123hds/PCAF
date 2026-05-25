@@ -1,231 +1,316 @@
-\documentclass{article}
+\documentclass[11pt]{article}
 
-% ── ICLR 2026 style ──────────────────────────────────────────────────────────
-%\usepackage{iclr2026_conference, times}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
 \usepackage{hyperref}
-\usepackage{url}
 
-% ── Math & Figures ────────────────────────────────────────────────────────────
-\usepackage{amsmath, amssymb, amsthm}
-\usepackage{graphicx}
-\usepackage{booktabs}       % professional tables
-\usepackage{multirow}
-\usepackage{subcaption}
-\usepackage[dvipsnames]{xcolor}
-\usepackage{algorithm, algorithmic}
-
-% ── Custom Commands ───────────────────────────────────────────────────────────
-\newcommand{\cs}{CS-Mamba}
-\newcommand{\lap}{\nabla^2}
+\newcommand{\csm}{CS-Mamba}
 \newcommand{\R}{\mathbb{R}}
-\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
-\newcommand{\BoxedEq}[1]{\fbox{$\displaystyle #1$}}
+\newcommand{\Lap}{\mathcal{L}}
+\newcommand{\sigmoid}{\operatorname{sigmoid}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\silu}{\operatorname{SiLU}}
+\newcommand{\gelu}{\operatorname{GELU}}
 
-%\iclrfinalcopy  % Remove for blind review submission
-
-% ─────────────────────────────────────────────────────────────────────────────
-\title{Continuous Spatial Mamba: Replacing 1D Scans with\\
-       Unitary Complex Schrödinger Diffusion in State Space Models}
-
-\author{
-  \todo{Author names after review}\\
-  \todo{Institution}\\
-}
+\title{CS-Mamba: Grid-Parallel Gated Spatial Recurrence for Vision}
+\author{}
+\date{}
 
 \begin{document}
-
 \maketitle
 
-% =============================================================================
-\begin{abstract}
-% =============================================================================
-State Space Models (SSMs) have emerged as a promising $\mathcal{O}(N)$ alternative to
-Transformers for visual recognition. However, existing vision SSMs (such as Vim and VMamba) 
-achieve 2D spatial awareness through multi-directional 1D scans—a heuristic that
-is both computationally redundant and mathematically destructive, as it causes severe 
-spatial topological amnesia. Standard Heat Equation PDE approaches attempted to solve 
-this via thermodynamic diffusion, but suffered from severe feature blurring. In this 
-paper, we propose \textbf{Continuous Spatial Mamba (\cs{})}, a fundamentally different 
-approach that replaces directional scans and dissipative heat diffusion with an explicit 
-2D \emph{Unitary Complex Schrödinger Diffusion} process. By mapping the hidden states 
-to a complex domain ($\psi = h_{\text{real}} + i h_{\text{imag}}$) and integrating 
-through the Schrödinger operator ($i \lap \psi$), \cs{} preserves 100\% of the spatial 
-gradients without blurring, creating rich constructive and destructive interference 
-patterns. We further stabilize feature amplitudes via a learnable Ginzburg-Landau 
-reaction term, establishing dynamic visual boundaries. By completely eliminating the 
-bloated Mamba State dimension ($S$), \cs{} reduces spatial tensor memory by $8\times$, 
-making the complex representation significantly faster and lighter than real-valued 
-alternatives. On Tiny-ImageNet-200, our \cs{}-V4 achieves 56.04\% Top-1 
-accuracy, crushing standard 1D scan baselines. Crucially, Empirical Receptive Field 
-(ERF) visualizations confirm that \cs{} develops pristine isotropic 2D receptive fields, 
-proving that unitary complex PDEs offer geometrically superior representations 
-for foundational vision models.
-\end{abstract}
+\section{Problem Statement}
 
-% =============================================================================
-\section{Introduction}
-% =============================================================================
+Images are naturally defined on a two-dimensional spatial grid, but many efficient
+sequence models operate on one-dimensional token sequences. When a patchified image
+is flattened into a sequence, the model must impose an artificial traversal order
+over the grid. Directional scan methods reduce this issue by scanning the image in
+multiple directions, but the resulting computation is still sequence-like: information
+is propagated along ordered paths rather than through the native two-dimensional
+neighborhood structure of the image.
 
-The Transformer architecture \citep{vaswani2017attention} has defined the
-state of the art in visual recognition since Vision Transformers (ViTs)
-demonstrated competitive performance \citep{dosovitskiy2020vit, touvron2021deit}. 
-However, the quadratic $\mathcal{O}(N^2)$ complexity of self-attention constitutes a 
-fundamental scalability bottleneck.
+This creates a mismatch between the structure of the data and the structure of the
+computation. Local image evidence is inherently geometric: edges, textures, contours,
+and object parts are formed by interactions among nearby patches in the horizontal,
+vertical, and diagonal directions. A vision recurrence should therefore preserve the
+image grid and update all spatial locations in parallel, while still allowing
+information to propagate beyond immediate neighbors through repeated computation.
 
-Structured State Space Models (SSMs) \citep{gu2021s4} offer a principled remedy,
-achieving linear $\mathcal{O}(N)$ complexity through continuous-time recurrence. 
-Mamba \citep{gu2023mamba} extended this family with an input-selective mechanism, 
-achieving strong results in language modeling. However, adapting this sequence modeling 
-success to 2D vision remains conceptually problematic.
+The problem addressed in this work is:
+\begin{quote}
+\emph{Can we build a Mamba-style vision block that performs recurrent spatial
+reasoning directly on the 2D patch grid, without relying on directional sequence
+scans, while preserving linear-time scaling in the number of patches?}
+\end{quote}
 
-\paragraph{The 1D Scan Limitation.}
-SSMs are fundamentally \emph{causal} and 1D. To circumvent this, existing Vision 
-Mambas such as Vim \citep{zhu2024vim} and VMamba \citep{liu2024vmamba} scan patched 
-images in multiple directions. This is computationally redundant and imposes artificial 
-anisotropy, breaking the native spatial isotropy of visual domains. Furthermore, over 
-long scans, standard SSMs suffer from \emph{topological amnesia}.
+\section{Novelty}
 
-\paragraph{Our Approach: Complex Unitary Diffusion.}
-We propose replacing the causal 1-D recurrence with a \emph{2-D complex-valued Schrödinger} wave
-process. By treating hidden states as a quantum wave function $\psi$ evolving across the
-spatial manifold, every patch communicates with its neighbours simultaneously
-without any arbitrary causal ordering constraints. Previous physically-inspired methods 
-relied on the Heat Equation, which acts as a dissipative low-pass filter and irreparably 
-blurs discriminative features. \cs{} solves this by leveraging \textbf{Unitary Evolution}.
-
-Our key contributions are:
-\begin{enumerate}
-    \item A \textbf{Unitary Spatial Diffusion} block utilizing the Schrödinger
-          equation. Unlike dissipative heat equations, the complex unitary operator perfectly
-          preserves spatial gradients and eliminates feature blurring (Theorem~\ref{thm:unitary}).
-    \item A division-free \textbf{Ginzburg-Landau Reaction Mechanism} that stabilizes feature
-          amplitudes to dynamically form stable visual patterns (like object boundaries) 
-          without heavy neural overhead.
-    \item A structural leap to \textbf{$S$-Free Complex States}. We completely remove
-          the bloated Mamba state dimension $S$ for spatial evaluation. This reduces the 
-          tensor geometry by $8\times$, boosting GPU/TPU throughput by over 33\% while 
-          the complex $(\text{real}, \text{imag})$ mapping strictly increases mathematical expressivity.
-    \item First-time empirical dominance of a continuous complex PDE over standard 
-          discrete Hilbert-scan Vision Mambas.
-\end{enumerate}
-
-% =============================================================================
-\section{Related Work}
-% =============================================================================
-
-\paragraph{Vision Transformers.}
-ViT \citep{dosovitskiy2020vit}, DeiT \citep{touvron2021deit}, and
-Swin \citep{liu2021swin} established modern vision baselines but suffer from quadratic complexity over sequence length.
-
-\paragraph{State Space Models for Vision.}
-Recent models like Vim \citep{zhu2024vim} and VMamba \citep{liu2024vmamba} adapt Mamba to images, but uniformly resort to multi-directional 1D scans (e.g., Cross-Scan Module) to proxy 2D context. Our method abandons directional scanning entirely.
-
-\paragraph{Continuous-Time Models and Physics.}
-Neural ODEs \citep{chen2018neuralode} and the continuous formulation in S4 \citep{gu2021s4} treat time as a continuous variable. However, they lack spatial coupling. PDE-Net \citep{long2018pde} learns PDE coefficients using MLPs. In contrast, we strictly enforce fixed physics (Schrödinger + Ginzburg-Landau) to guarantee unitary stability, learning only the localized diffusion rate.
-
-% =============================================================================
-\section{Methodology}
-% =============================================================================
-
-\subsection{Preliminaries: Standard Discretisation and Spatial Amnesia}
-Given a continuous-time State Space Model defined by $h'(t) = A h(t) + B x(t)$,
-the typical Mamba discretisation via Zero-Order Hold (ZOH) with step $\Delta$ translates this system into the recurrent 1D update $h_n = \bar{A}_n h_{n-1} + \bar{B}_n x_n$.
-Because $\|\bar{A}_n\| < 1$, the state decays exponentially with sequence depth. In 2D vision, this leads to structural feature decay and \textbf{Topological Amnesia}, regardless of the multithreading scan path used.
-
-\subsection{Unitary Quantum Reformulation}
-\label{sec:pde}
-
-To break the 1D limitation, let $\psi : [0,T] \times \Omega \to \mathbb{C}^D$ be a continuous \emph{complex-valued} hidden-state field defined on the image domain $\Omega \subset \mathbb{R}^2$, where $\psi(\mathbf{r},t) = h_{\mathrm{real}}(\mathbf{r},t) + i\,h_{\mathrm{imag}}(\mathbf{r},t)$.
-We replace the 1D recurrence with a \textbf{Physics-Informed Complex PDE}:
-\begin{equation}
-  \BoxedEq{
-    \frac{\partial \psi}{\partial t} = 
-    \underbrace{\Delta_{\mathrm{self}} \bigl(A\,\psi + B\,x\bigr)}_{\text{Force 1: internal decay}}
-    + \underbrace{i\,\Delta_{\mathrm{diff}} \mathcal{D}\,\nabla^2 \psi}_{\text{Force 2: Schrödinger diffusion}}
-    + \underbrace{\psi(\alpha - \beta|\psi|^2)}_{\text{Force 3: Ginzburg-Landau reaction}}
-  }
-  \label{eq:cs-mamba-pde}
-\end{equation}
-where $\mathcal{D}$ is the learned spatial operator (approximated by a depthwise convolution), and $\alpha, \beta$ are learnable channel-wise parameters.
-
-\paragraph{Physical Interpretation.}
-In earlier spatial PDE attempts (V2), the diffusion operator $D \nabla^2$ was based on the Heat Equation. The heat equation is strictly dissipative, blurring away discriminative visual features. By transitioning to a \textit{Schrödinger}-type equation featuring the imaginary unit $i$, the spatial diffusion becomes a \textbf{unitary operator}. Information is never blurred away; instead, it rotates in the complex plane, propagating spatial context through constructive and destructive phase interference. Finally, the \textbf{Ginzburg-Landau reaction term} stabilizes the amplitude $|\psi|$ to form robust structural patterns without requiring computationally expensive divisions.
-
-\subsection{Unitary Feature Preservation}
-\label{sec:unitary}
-
-Computing $i \nabla^2 \psi$ couples the real and imaginary components natively in hardware (such as TPU XLA) without requiring bloated native complex structures:
-\begin{equation}
-    i \nabla^2 (h_{\mathrm{real}} + i h_{\mathrm{imag}}) = -\nabla^2 h_{\mathrm{imag}} + i \nabla^2 h_{\mathrm{real}}
-\end{equation}
-
-\begin{theorem}[Energy Preservation of Schrödinger Diffusion]
-\label{thm:unitary}
-In the absence of explicit internal SSM decay ($A=0$) and reaction factors, the signal evolution governed purely by $\frac{\partial \psi}{\partial t} = i \mathcal{D} \nabla^2 \psi$ is unitary. Thus, the total spatial energy of the visual features is strictly conserved:
+\csm{} proposes a grid-parallel spatial recurrence for visual recognition. The
+model keeps the patch representation as a three-dimensional token tensor
 \[
-    \frac{d}{dt} \int_{\Omega} |\psi(\mathbf{r},t)|^2 \, d\mathbf{r} = 0.
+    x \in \R^{B \times N \times D},
 \]
-\end{theorem}
-\begin{proof}
-Multiplying the PDE by the complex conjugate $\psi^*$ and integrating across the geometric bounds reveals that the imaginary diffusion perfectly cancels out energetic changes. The gradients flowing backwards through time are thus perfectly bounded.
-\end{proof}
+where $B$ is batch size, $N=H W$ is the number of image patches, and $D$ is the
+expanded channel dimension. During the recurrent update, this tensor is reshaped
+into the image grid:
+\[
+    \R^{B \times N \times D}
+    \longleftrightarrow
+    \R^{B \times D \times H \times W}.
+\]
+Thus the model remains compatible with standard token projections while performing
+the core recurrence over the native two-dimensional patch field.
 
-\subsection{Explicit Euler PDE Integrator \& Lean Dimensionality}
-\label{sec:euler}
+The novelty consists of four components.
 
-Standard Vision Mamba evaluates hidden states $h \in \mathbb{R}^{B \times N \times D \times S}$, where $S \ge 16$. Extending scanning to spatial PDEs over a massive 4D tensor guarantees out-of-memory (OOM) failures on modern accelerators.
+\paragraph{Grid-parallel recurrence.}
+All patch locations are updated simultaneously at each recurrence step. The model
+does not scan through tokens sequentially. Instead, spatial context propagates
+through local neighborhood interaction over the patch grid.
 
-To maintain extreme efficiency, we \textbf{eliminate the SSM dimension $S$} entirely in the spatial domain. Our lean complex hidden state comprises strictly $h_{\mathrm{real}}, h_{\mathrm{imag}} \in \mathbb{R}^{B \times N \times D}$. Because a complex number inherently models 2-D amplitude and phase, we recover greater mathematical expressivity while consuming precisely $8\times$ less memory bandwidth than a standard real-valued Mamba integration.
+\paragraph{Gated local spatial evolution.}
+\csm{} combines Mamba-style selective gates with a fixed local spatial operator.
+The gates determine channel-wise self dynamics, input injection, and diffusion
+strength, while the spatial operator propagates information through neighboring
+patches.
 
-Given an initial state $h_{\mathrm{real}}^{(0)} = x, \; h_{\mathrm{imag}}^{(0)} = 0$, we perform $K$ Euler steps ($dt = 1/K$):
+\paragraph{Parameter-free recurrence depth.}
+The number of recurrence steps $K$ controls computational depth and effective
+receptive field without changing the number of parameters. Increasing $K$ allows
+information to travel farther across the image grid, trading compute for accuracy.
+
+\paragraph{Optional nonlinear recurrent dynamics.}
+The default recurrence is a gated linear spatial evolution, which is fast and
+stable. We also support nonlinear recurrence by applying an activation function
+inside each recurrent step. This converts the block into a weight-shared nonlinear
+dynamical system without adding parameters.
+
+\section{Proposed Solution}
+
+Given an input image $I \in \R^{B \times 3 \times R \times R}$, a patch embedding
+layer maps the image into a token grid:
+\[
+    x_0 \in \R^{B \times N \times d},
+    \qquad
+    N = H W = \left(\frac{R}{P}\right)^2,
+\]
+where $P$ is patch size. A \csm{} block first normalizes and expands the token
+features:
 \begin{align}
-    F_{\mathrm{diff, real}}^{(k)} &= \Delta_{\mathrm{diff}} \odot \bigl(-\mathcal{W}_{\mathrm{diff}} * h_{\mathrm{imag}}^{(k)}\bigr) \\
-    F_{\mathrm{diff, imag}}^{(k)} &= \Delta_{\mathrm{diff}} \odot \bigl(+\mathcal{W}_{\mathrm{diff}} * h_{\mathrm{real}}^{(k)}\bigr) \\
-    R^{(k)} &= \alpha - \beta \bigl((h_{\mathrm{real}}^{(k)})^2 + (h_{\mathrm{imag}}^{(k)})^2\bigr) \\
-    h_{\mathrm{real}}^{(k+1)} &= h_{\mathrm{real}}^{(k)} + dt \bigl( F_{\mathrm{diff, real}}^{(k)} + R^{(k)} \odot h_{\mathrm{real}}^{(k)} \bigr) \\
-    h_{\mathrm{imag}}^{(k+1)} &= h_{\mathrm{imag}}^{(k)} + dt \bigl( F_{\mathrm{diff, imag}}^{(k)} + R^{(k)} \odot h_{\mathrm{imag}}^{(k)} \bigr)
+    [u,z] &= W_{\mathrm{in}}\,\operatorname{LN}(x), \\
+    u    &= \silu\!\left(\operatorname{DWConv}_{3\times 3}(u)\right).
 \end{align}
-The final layer output is evaluated via a learned projection: $y = W_{\mathrm{re}} h_{\mathrm{real}}^{(K)} + W_{\mathrm{im}} h_{\mathrm{imag}}^{(K)} + D x$.
+Here $u$ is the branch passed to the spatial recurrence and $z$ is an output gate.
+The depthwise convolution is a lightweight local preprocessing step before recurrent
+spatial propagation.
 
-% =============================================================================
-\section{Experiments}
-% =============================================================================
+The core recurrence evolves a hidden state $h_k \in \R^{B \times N \times D}$ for
+$K$ steps. The hidden state is initialized using a bounded input gate:
+\[
+    h_0 = u \odot \tanh(W_B u).
+\]
+At each step, the model combines three forces:
+\begin{enumerate}
+    \item a stable self term that preserves channel-wise recurrent memory,
+    \item an input injection term that anchors the dynamics to the current block input,
+    \item a local spatial diffusion term that exchanges information among neighboring patches.
+\end{enumerate}
+The final recurrent state is modulated by a sigmoid output gate:
+\[
+    \tilde{y} = h_K \odot \sigmoid(W_C u),
+\]
+and the block output is
+\[
+    y = x + W_{\mathrm{out}}\left(\tilde{y} \odot \silu(z)\right).
+\]
 
-\subsection{Experimental Setup}
-\todo{Tiny-ImageNet details. Training: 100 epochs, AdamW, cosine LR, Global BS 512, Hardware: TPU v4.}
+\section{Methodology}
 
-\subsection{Ablation Studies: The Dominance of Unitary Diffusion}
-\begin{table}[h]
-\centering
-\caption{Ablation on Tiny-ImageNet-200 testing the evolution of PDE forces.}
-\begin{tabular}{llc}
-\toprule
-\textbf{Model Version} & \textbf{Spatial PDE Formulation} & \textbf{Val Acc (\%)} \\
-\midrule
-V1 Baseline        & Standard 1D Scanning (No PDE)  & 52.72 \\
-V2 Heat Equation   & Dissipative Heat Blur ($D \nabla^2$)     & 51.77 \\
-V3 Reaction-Diff   & Allen-Cahn Pattern Formation   & 39.8 \\
-\textbf{V4 (Ours)} & \textbf{Complex Unitary Schrödinger} & \textbf{56.04} \\
-\bottomrule
-\end{tabular}
-\label{tab:ablation}
-\end{table}
+\subsection{Selective Gates and Stable Dynamics}
 
-\todo{Add explicit discussion of how V4 obliterated the Heat Equation baseline by preserving gradients and converging nearly 33\% faster due to the Lean S-Free geometry.}
+Let $u \in \R^{B \times N \times D}$ be the expanded feature tensor entering the
+spatial recurrence. \csm{} constructs two input-dependent positive gates:
+\begin{align}
+    \Delta_{\mathrm{self}}(u)
+        &= \operatorname{clip}\!\left(
+            \softplus(W_{\mathrm{self}} u), 0, \Delta_{\max}
+        \right), \\
+    \Delta_{\mathrm{diff}}(u)
+        &= \operatorname{clip}\!\left(
+            \softplus(W_{\mathrm{diff}} u), 0, \Delta_{\max}
+        \right).
+\end{align}
+The first gate controls self dynamics and input injection; the second controls
+spatial diffusion. The clipping constant $\Delta_{\max}$ stabilizes the explicit
+Euler update by preventing large per-step changes.
 
-% =============================================================================
-\section{Conclusion}
-% =============================================================================
-We have presented \cs{}, a vision State Space Model that replaces multi-directional 
-1D scanning and dissipative spatial modeling with \textbf{Unitary Complex Schrödinger Diffusion}. 
-By embedding energy-preserving PDE rotations inside the continuous SSM block, our model 
-builds rich 2D spatial reasoning while mathematically protecting the gradients from 
-spatial decay. Eliminating the state dimension $S$ reduced tensor size by 8x, drastically 
-lowering latency and memory costs. As confirmed empirically, the \cs{} unitary approach 
-demonstrates that true geometric physics offers a strictly superior and interpretable 
-foundation for spatial reasoning compared to scan-based approximations.
+The channel-wise self dynamics are parameterized as negative values:
+\[
+    A = -\softplus(A_{\log}),
+\]
+which biases the recurrent system toward stable decay rather than uncontrolled
+growth. The diffusion coefficient is bounded as
+\[
+    D_{\mathrm{phys}} = 0.5 \cdot \sigmoid(\theta_D).
+\]
+This keeps the spatial update numerically controlled while allowing each channel
+to learn a different diffusion strength.
 
-\bibliography{references}
-\bibliographystyle{iclr2026_conference}
+\subsection{Four-Neighbor Spatial Recurrence}
+
+The default \csm{} spatial operator is a four-neighbor Laplacian on the patch grid.
+Before applying the operator, the hidden state is reshaped:
+\[
+    h_k \in \R^{B \times N \times D}
+    \quad\rightarrow\quad
+    h_k^{2D} \in \R^{B \times D \times H \times W}.
+\]
+For a grid location $(i,j)$, the four-neighbor Laplacian is
+\[
+    \Lap_4(h)_{i,j}
+    =
+    h_{i-1,j} + h_{i+1,j} + h_{i,j-1} + h_{i,j+1} - 4h_{i,j}.
+\]
+Boundary values use replication padding, corresponding to a discrete Neumann
+boundary condition.
+
+With $dt=1/K$, define
+\begin{align}
+    c(u) &= 1 + dt \cdot \Delta_{\mathrm{self}}(u) \odot A, \\
+    b(u) &= dt \cdot \Delta_{\mathrm{self}}(u) \odot h_0, \\
+    d(u) &= dt \cdot \Delta_{\mathrm{diff}}(u) \odot D_{\mathrm{phys}}.
+\end{align}
+The recurrence update is
+\[
+    h_{k+1}
+    =
+    c(u) \odot h_k
+    + b(u)
+    + d(u) \odot \Lap_4(h_k).
+\]
+This update is performed for $k=0,\ldots,K-1$. All spatial locations are updated
+in parallel within each step. After $K$ steps, information can propagate across
+approximately $K$ local grid hops.
+
+\subsection{Nonlinear Recurrent Evolution}
+
+The default recurrence uses the identity activation inside each step:
+\[
+    h_{k+1} = g(h_k,u),
+\]
+where $g$ denotes the gated spatial update above. To increase expressivity without
+adding parameters, we also evaluate
+\[
+    h_{k+1} = \phi(g(h_k,u)),
+\]
+where
+\[
+    \phi \in
+    \{\operatorname{identity}, \operatorname{SiLU}, \tanh, \operatorname{GELU},
+      \operatorname{ReLU6}, \operatorname{ReLU}\}.
+\]
+With $\phi=\operatorname{identity}$, the recurrent evolution is linear in $h_k$
+for fixed gates, while the gates remain nonlinear functions of the input. With a
+nonlinear $\phi$, the recurrence becomes a weight-shared nonlinear dynamical system:
+\[
+    h_K = \phi\!\left(g\left(\phi\!\left(g(\cdots \phi(g(h_0,u)) )\right),u\right)\right).
+\]
+This increases computational expressivity without increasing parameter count. In
+practice, smooth activations such as SiLU are especially attractive because they
+preserve negative state values and are less brittle than hard rectification.
+
+\subsection{Eight-Neighbor Laplacian Ablation}
+
+The main model uses the four axial neighbors. We also study an eight-neighbor
+variant that includes diagonal interactions:
+\[
+\begin{aligned}
+    \Lap_8(h)_{i,j}
+    &=
+    h_{i-1,j} + h_{i+1,j} + h_{i,j-1} + h_{i,j+1} \\
+    &\quad
+    + h_{i-1,j-1} + h_{i-1,j+1}
+    + h_{i+1,j-1} + h_{i+1,j+1}
+    - 8h_{i,j}.
+\end{aligned}
+\]
+This ablation tests whether diagonal propagation improves accuracy. It is expected
+to be slightly more expensive because it reads eight neighbors instead of four.
+If the four-neighbor operator matches the eight-neighbor operator, the simpler
+operator is preferred for efficiency. If the eight-neighbor operator improves
+accuracy, it represents a clear accuracy-speed tradeoff.
+
+\subsection{Learned Local Operator Ablations}
+
+To test whether the fixed Laplacian is essential, we compare it with learned
+depthwise local operators. A depthwise 2D convolution replaces $\Lap_4$ with a
+learned $3\times3$ kernel initialized as
+\[
+    \begin{bmatrix}
+    0 & 1 & 0 \\
+    1 & -4 & 1 \\
+    0 & 1 & 0
+    \end{bmatrix}.
+\]
+We also evaluate a depthwise 1D convolution over the flattened grid, initialized
+as the second-difference stencil
+\[
+    [1,\,-2,\,1].
+\]
+These ablations separate the contribution of the proposed recurrent formulation
+from the exact choice of spatial operator. If learned Conv1D or Conv2D operators
+obtain similar accuracy but slower execution, the fixed Laplacian is justified as
+an efficient spatial prior.
+
+\subsection{Complexity and Receptive Field}
+
+Let $N=H W$ be the number of patches, $D$ the expanded channel dimension, and $K$
+the recurrence depth. The four-neighbor recurrence has time complexity
+\[
+    \mathcal{O}(B K N D)
+\]
+and stores a recurrent state of size
+\[
+    \mathcal{O}(B N D).
+\]
+The number of learned parameters is independent of $K$. Thus $K$ acts as a
+parameter-free expressivity knob:
+\[
+    K \uparrow
+    \quad\Rightarrow\quad
+    \text{larger effective receptive field and deeper computation}.
+\]
+For a token grid of size $T=N$, a natural large-context setting is
+\[
+    K = \lceil \log_2 T \rceil.
+\]
+For Tiny-ImageNet with $64\times64$ images and $4\times4$ patches, $T=256$ and
+$K=8$. For ImageNet-1K with $224\times224$ images and $16\times16$ patches,
+$T=196$ and $K=8$. Smaller values such as $K=3$ provide a faster local-recurrence
+setting and are useful for accuracy-efficiency tradeoff studies.
+
+\section{Empirical Questions}
+
+The method directly motivates the following empirical questions.
+
+\paragraph{Does grid-parallel recurrence outperform directional scans?}
+The primary comparison is against scan-based vision SSM baselines under matched
+training settings. The desired outcome is equal or better accuracy with lower
+epoch time or higher throughput.
+
+\paragraph{How much recurrence depth is needed?}
+Ablating $K$ measures whether additional recurrent computation improves accuracy
+without increasing model size.
+
+\paragraph{Is the fixed Laplacian sufficient?}
+Comparing four-neighbor Laplacian, eight-neighbor Laplacian, learned Conv2D, and
+learned Conv1D tests whether the model depends on a specific handcrafted stencil
+or whether local recurrent spatial propagation is the main source of performance.
+
+\paragraph{Does nonlinear recurrence help?}
+Comparing identity, SiLU, tanh, GELU, ReLU6, and ReLU inside the recurrent update
+tests whether parameter-free nonlinear recurrent computation improves visual
+recognition while preserving the grid-parallel execution pattern.
 
 \end{document}
