@@ -26,6 +26,21 @@ def laplacian_2d_neumann(h_2d: torch.Tensor) -> torch.Tensor:
     )
 
 
+def laplacian_2d_neumann8(h_2d: torch.Tensor) -> torch.Tensor:
+    h_pad = F.pad(h_2d, (1, 1, 1, 1), mode="replicate")
+    return (
+        h_pad[:, :, 0:-2, 1:-1]
+        + h_pad[:, :, 2:, 1:-1]
+        + h_pad[:, :, 1:-1, 0:-2]
+        + h_pad[:, :, 1:-1, 2:]
+        + h_pad[:, :, 0:-2, 0:-2]
+        + h_pad[:, :, 0:-2, 2:]
+        + h_pad[:, :, 2:, 0:-2]
+        + h_pad[:, :, 2:, 2:]
+        - 8.0 * h_2d
+    )
+
+
 def cs_mamba_v12_forward_reference(h0, delta_s, delta_d, A, D_phys, K, H, W):
     bsz, n_tokens, d_dim = h0.shape
     assert H * W == n_tokens, f"H*W={H * W} != N={n_tokens}"
@@ -52,7 +67,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
         self.d_model = d_model
         self.expand = expand
         d_inner = int(expand * d_model)
-        if spatial_op not in {"laplacian", "conv2d", "conv1d"}:
+        if spatial_op not in {"laplacian", "laplacian8", "conv2d", "conv1d"}:
             raise ValueError(f"Unsupported spatial_op={spatial_op!r}")
         self.spatial_op = spatial_op
 
@@ -116,6 +131,8 @@ class ContinuousSpatialSSM_V12(nn.Module):
     def _spatial_mix(self, h_2d: torch.Tensor) -> torch.Tensor:
         if self.spatial_op == "laplacian":
             return laplacian_2d_neumann(h_2d)
+        if self.spatial_op == "laplacian8":
+            return laplacian_2d_neumann8(h_2d)
         if self.spatial_op == "conv2d":
             return self.spatial_conv2d(F.pad(h_2d, (1, 1, 1, 1), mode="replicate"))
 

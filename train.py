@@ -24,6 +24,7 @@ import copy
 import time
 import sys
 import os
+import shutil
 
 # Make sure local modules are importable from any working directory
 sys.path.insert(0, os.path.dirname(__file__))
@@ -209,10 +210,44 @@ class AddGaussianNoise(object):
             return tensor + torch.randn(tensor.size()) * self.std + self.mean
         return tensor
 
+def prepare_tiny_imagenet_val(data_dir: str) -> str:
+    val_dir = os.path.join(data_dir, "val")
+    imagefolder_val = os.path.join(data_dir, "val_imagefolder")
+    annotations = os.path.join(val_dir, "val_annotations.txt")
+    images_dir = os.path.join(val_dir, "images")
+    if os.path.isdir(imagefolder_val):
+        return imagefolder_val
+    if not (os.path.isfile(annotations) and os.path.isdir(images_dir)):
+        return val_dir
+
+    os.makedirs(imagefolder_val, exist_ok=True)
+    with open(annotations, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 2:
+                continue
+            image_name, class_name = parts[0], parts[1]
+            src = os.path.join(images_dir, image_name)
+            class_dir = os.path.join(imagefolder_val, class_name)
+            dst = os.path.join(class_dir, image_name)
+            os.makedirs(class_dir, exist_ok=True)
+            if os.path.exists(dst):
+                continue
+            try:
+                os.symlink(os.path.relpath(src, class_dir), dst)
+            except OSError:
+                shutil.copy2(src, dst)
+    return imagefolder_val
+
 def get_dataloaders(cfg):
     # ── VMamba recipe: RandAugment + RandomErasing ──────────────────────
+    is_tiny = cfg.dataset == 'tiny-imagenet'
+    crop_size = cfg.img_size if is_tiny else 32
+    padding = 8 if is_tiny else 4
+    mean = (0.4802, 0.4481, 0.3975) if is_tiny else (0.4914, 0.4822, 0.4465)
+    std = (0.2302, 0.2265, 0.2262) if is_tiny else (0.2023, 0.1994, 0.2010)
     train_aug = [
-        T.RandomCrop(32, padding=4),
+        T.RandomCrop(crop_size, padding=padding),
         T.RandomHorizontalFlip(),
     ]
     if getattr(cfg, 'randaug', False):
@@ -222,8 +257,7 @@ def get_dataloaders(cfg):
         train_aug.append(T.RandAugment(num_ops=2, magnitude=m))
     train_aug += [
         T.ToTensor(),
-        T.Normalize((0.4914, 0.4822, 0.4465),
-                    (0.2023, 0.1994, 0.2010)),
+        T.Normalize(mean, std),
         AddGaussianNoise(0., cfg.noise_std),
     ]
     if getattr(cfg, 'reprob', 0.0) > 0.0:
@@ -232,15 +266,19 @@ def get_dataloaders(cfg):
 
     val_tf = T.Compose([
         T.ToTensor(),
-        T.Normalize((0.4914, 0.4822, 0.4465),
-                    (0.2023, 0.1994, 0.2010)),
+        T.Normalize(mean, std),
         AddGaussianNoise(0., cfg.noise_std)
     ])
 
-    train_ds = torchvision.datasets.CIFAR10(
-        root=cfg.data_dir, train=True,  download=True, transform=train_tf)
-    val_ds   = torchvision.datasets.CIFAR10(
-        root=cfg.data_dir, train=False, download=True, transform=val_tf)
+    if is_tiny:
+        train_ds = torchvision.datasets.ImageFolder(os.path.join(cfg.data_dir, "train"), transform=train_tf)
+        val_ds = torchvision.datasets.ImageFolder(prepare_tiny_imagenet_val(cfg.data_dir), transform=val_tf)
+    else:
+        dataset_cls = torchvision.datasets.CIFAR100 if cfg.dataset == 'cifar100' else torchvision.datasets.CIFAR10
+        train_ds = dataset_cls(
+            root=cfg.data_dir, train=True,  download=True, transform=train_tf)
+        val_ds   = dataset_cls(
+            root=cfg.data_dir, train=False, download=True, transform=val_tf)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size,
@@ -408,6 +446,7 @@ def parse_args():
                    default='all', help="Which model(s) to train")
 
     # Data
+    p.add_argument('--dataset', choices=['cifar10', 'cifar100', 'tiny-imagenet'], default='cifar10')
     p.add_argument('--data_dir',     default='./data')
     p.add_argument('--num_workers',  type=int, default=4)
     p.add_argument('--noise_std',    type=float, default=0.0,
@@ -435,7 +474,7 @@ def parse_args():
                    help="Discrete Euler steps defining forward diffusion time")
     p.add_argument('--drop_path',  type=float, default=0.1)
     p.add_argument('--spatial_op', default='laplacian',
-                   choices=['laplacian', 'conv2d', 'conv1d'],
+                   choices=['laplacian', 'laplacian8', 'conv2d', 'conv1d'],
                    help="V1.2 spatial operator ablation")
     p.add_argument('--use_triton', action='store_true',
                    help="Use custom CUDA/Triton scan kernels for supported models")
@@ -474,7 +513,7 @@ def main():
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-    cfg.n_classes = 10
+    cfg.n_classes = 200 if cfg.dataset == 'tiny-imagenet' else (100 if cfg.dataset == 'cifar100' else 10)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")

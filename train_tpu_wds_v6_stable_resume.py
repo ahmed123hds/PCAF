@@ -153,7 +153,7 @@ def parse_args():
     p.add_argument("--K_steps", type=int, default=4)
     p.add_argument("--n_classes", type=int, default=1000)
     p.add_argument("--drop_path", type=float, default=0.1)
-    p.add_argument("--spatial_op", choices=["laplacian", "conv2d", "conv1d"], default="laplacian",
+    p.add_argument("--spatial_op", choices=["laplacian", "laplacian8", "conv2d", "conv1d"], default="laplacian",
                    help="V1.2 spatial operator ablation")
     p.add_argument("--n_flow_groups", type=int, default=8, help="Number of flow groups for transport")
 
