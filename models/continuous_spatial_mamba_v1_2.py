@@ -62,14 +62,23 @@ def cs_mamba_v12_forward_reference(h0, delta_s, delta_d, A, D_phys, K, H, W):
 
 
 class ContinuousSpatialSSM_V12(nn.Module):
-    def __init__(self, d_model: int, expand: int = 2, spatial_op: str = "laplacian"):
+    def __init__(
+        self,
+        d_model: int,
+        expand: int = 2,
+        spatial_op: str = "laplacian",
+        recurrence_nonlinearity: str = "identity",
+    ):
         super().__init__()
         self.d_model = d_model
         self.expand = expand
         d_inner = int(expand * d_model)
         if spatial_op not in {"laplacian", "laplacian8", "conv2d", "conv1d"}:
             raise ValueError(f"Unsupported spatial_op={spatial_op!r}")
+        if recurrence_nonlinearity not in {"identity", "silu", "tanh", "gelu", "relu6", "relu"}:
+            raise ValueError(f"Unsupported recurrence_nonlinearity={recurrence_nonlinearity!r}")
         self.spatial_op = spatial_op
+        self.recurrence_nonlinearity = recurrence_nonlinearity
 
         self.dt_self_proj = nn.Linear(d_inner, d_inner, bias=True)
         self.dt_diff_proj = nn.Linear(d_inner, d_inner, bias=True)
@@ -141,6 +150,21 @@ class ContinuousSpatialSSM_V12(nn.Module):
         mixed = self.spatial_conv1d(F.pad(h_1d, (1, 1), mode="replicate"))
         return mixed.view(bsz, d_dim, height, width)
 
+    def _recurrence_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.recurrence_nonlinearity == "identity":
+            return x
+        if self.recurrence_nonlinearity == "silu":
+            return F.silu(x)
+        if self.recurrence_nonlinearity == "tanh":
+            return torch.tanh(x)
+        if self.recurrence_nonlinearity == "gelu":
+            return F.gelu(x)
+        if self.recurrence_nonlinearity == "relu6":
+            return F.relu6(x)
+        if self.recurrence_nonlinearity == "relu":
+            return F.relu(x)
+        raise RuntimeError(f"Unsupported recurrence_nonlinearity={self.recurrence_nonlinearity!r}")
+
     def forward(self, x: torch.Tensor, K_steps: int = 3, use_triton: bool = False) -> torch.Tensor:
         bsz, n_tokens, d_dim = x.shape
         del bsz
@@ -169,7 +193,9 @@ class ContinuousSpatialSSM_V12(nn.Module):
             diff_coeff = dt * delta_d_spatial * D_phys.view(1, d_dim, 1, 1)
 
             for _ in range(K_steps):
-                h = h * self_coeff + input_term + diff_coeff * self._spatial_mix(h)
+                h = self._recurrence_activation(
+                    h * self_coeff + input_term + diff_coeff * self._spatial_mix(h)
+                )
 
             h = h.flatten(2).transpose(1, 2)
 
@@ -178,7 +204,13 @@ class ContinuousSpatialSSM_V12(nn.Module):
 
 
 class ContinuousSpatialMambaBlock_V12(nn.Module):
-    def __init__(self, d_model: int, expand: int = 2, spatial_op: str = "laplacian"):
+    def __init__(
+        self,
+        d_model: int,
+        expand: int = 2,
+        spatial_op: str = "laplacian",
+        recurrence_nonlinearity: str = "identity",
+    ):
         super().__init__()
         d_inner = int(expand * d_model)
         self.in_proj = nn.Linear(d_model, d_inner * 2, bias=False)
@@ -191,7 +223,12 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
             bias=True,
         )
         self.activation = nn.SiLU()
-        self.continuous_ssm = ContinuousSpatialSSM_V12(d_model=d_model, expand=expand, spatial_op=spatial_op)
+        self.continuous_ssm = ContinuousSpatialSSM_V12(
+            d_model=d_model,
+            expand=expand,
+            spatial_op=spatial_op,
+            recurrence_nonlinearity=recurrence_nonlinearity,
+        )
         self.norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
 
@@ -229,8 +266,13 @@ class ContinuousSpatialMambaClassifier_V12(nn.Module):
             d_embed=cfg.d_embed,
         )
         self.spatial_op = getattr(cfg, "spatial_op", "laplacian")
+        self.recurrence_nonlinearity = getattr(cfg, "recurrence_nonlinearity", "identity")
         self.blocks = nn.ModuleList([
-            ContinuousSpatialMambaBlock_V12(cfg.d_embed, spatial_op=self.spatial_op)
+            ContinuousSpatialMambaBlock_V12(
+                cfg.d_embed,
+                spatial_op=self.spatial_op,
+                recurrence_nonlinearity=self.recurrence_nonlinearity,
+            )
             for _ in range(cfg.n_mamba_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_embed)
