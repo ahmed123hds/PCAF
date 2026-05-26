@@ -513,8 +513,10 @@ def parse_args():
                    choices=['identity', 'silu', 'tanh', 'gelu', 'relu6', 'relu'],
                    help="V1.2 activation applied after each recurrence step")
     p.add_argument('--integrator', default='euler',
-                   choices=['euler', 'heun', 'rk4'],
+                   choices=['euler', 'heun', 'rk4', 'imex'],
                    help="V1.2 recurrence integrator")
+    p.add_argument('--imex_iters', type=int, default=3,
+                   help="Jacobi iterations for the V1.2 IMEX integrator")
     p.add_argument('--use_triton', action='store_true',
                    help="Use custom CUDA/Triton scan kernels for supported models")
     p.add_argument('--compile', action='store_true',

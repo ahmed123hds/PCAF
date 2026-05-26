@@ -159,8 +159,10 @@ def parse_args():
                    choices=["identity", "silu", "tanh", "gelu", "relu6", "relu"],
                    default="identity",
                    help="V1.2 activation applied after each recurrence step")
-    p.add_argument("--integrator", choices=["euler", "heun", "rk4"], default="euler",
+    p.add_argument("--integrator", choices=["euler", "heun", "rk4", "imex"], default="euler",
                    help="V1.2 recurrence integrator")
+    p.add_argument("--imex_iters", type=int, default=3,
+                   help="Jacobi iterations for the V1.2 IMEX integrator")
     p.add_argument("--n_flow_groups", type=int, default=8, help="Number of flow groups for transport")
 
     # Optimizer
@@ -575,6 +577,7 @@ def _mp_fn(index, flags):
     cfg.spatial_op = flags.spatial_op
     cfg.recurrence_nonlinearity = flags.recurrence_nonlinearity
     cfg.integrator = flags.integrator
+    cfg.imex_iters = flags.imex_iters
     cfg.n_flow_groups = flags.n_flow_groups
 
     if flags.model_version == "v1":

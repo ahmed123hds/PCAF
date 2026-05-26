@@ -69,6 +69,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
         spatial_op: str = "laplacian",
         recurrence_nonlinearity: str = "identity",
         integrator: str = "euler",
+        imex_iters: int = 3,
     ):
         super().__init__()
         self.d_model = d_model
@@ -78,11 +79,12 @@ class ContinuousSpatialSSM_V12(nn.Module):
             raise ValueError(f"Unsupported spatial_op={spatial_op!r}")
         if recurrence_nonlinearity not in {"identity", "silu", "tanh", "gelu", "relu6", "relu"}:
             raise ValueError(f"Unsupported recurrence_nonlinearity={recurrence_nonlinearity!r}")
-        if integrator not in {"euler", "heun", "rk4"}:
+        if integrator not in {"euler", "heun", "rk4", "imex"}:
             raise ValueError(f"Unsupported integrator={integrator!r}")
         self.spatial_op = spatial_op
         self.recurrence_nonlinearity = recurrence_nonlinearity
         self.integrator = integrator
+        self.imex_iters = int(imex_iters)
 
         self.dt_self_proj = nn.Linear(d_inner, d_inner, bias=True)
         self.dt_diff_proj = nn.Linear(d_inner, d_inner, bias=True)
@@ -154,6 +156,26 @@ class ContinuousSpatialSSM_V12(nn.Module):
         mixed = self.spatial_conv1d(F.pad(h_1d, (1, 1), mode="replicate"))
         return mixed.view(bsz, d_dim, height, width)
 
+    def _neighbor_sum(self, h_2d: torch.Tensor) -> tuple[torch.Tensor, int]:
+        h_pad = F.pad(h_2d, (1, 1, 1, 1), mode="replicate")
+        axial = (
+            h_pad[:, :, 0:-2, 1:-1]
+            + h_pad[:, :, 2:, 1:-1]
+            + h_pad[:, :, 1:-1, 0:-2]
+            + h_pad[:, :, 1:-1, 2:]
+        )
+        if self.spatial_op == "laplacian":
+            return axial, 4
+        if self.spatial_op == "laplacian8":
+            diagonal = (
+                h_pad[:, :, 0:-2, 0:-2]
+                + h_pad[:, :, 0:-2, 2:]
+                + h_pad[:, :, 2:, 0:-2]
+                + h_pad[:, :, 2:, 2:]
+            )
+            return axial + diagonal, 8
+        raise RuntimeError("IMEX integrator is only defined for laplacian and laplacian8 spatial operators.")
+
     def _recurrence_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.recurrence_nonlinearity == "identity":
             return x
@@ -182,6 +204,27 @@ class ContinuousSpatialSSM_V12(nn.Module):
             delta_s_spatial * (A.view(1, -1, 1, 1) * h + h0_spatial)
             + delta_d_spatial * D_phys.view(1, -1, 1, 1) * self._spatial_mix(h)
         )
+
+    def _imex_step(
+        self,
+        h: torch.Tensor,
+        dt: float,
+        delta_s_spatial: torch.Tensor,
+        delta_d_spatial: torch.Tensor,
+        A: torch.Tensor,
+        h0_spatial: torch.Tensor,
+        D_phys: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.spatial_op not in {"laplacian", "laplacian8"}:
+            raise RuntimeError("IMEX integrator is only supported for laplacian and laplacian8.")
+
+        rhs = h + dt * delta_s_spatial * (A.view(1, -1, 1, 1) * h + h0_spatial)
+        alpha = dt * delta_d_spatial * D_phys.view(1, -1, 1, 1)
+        z = rhs
+        for _ in range(self.imex_iters):
+            neighbor_sum, degree = self._neighbor_sum(z)
+            z = (rhs + alpha * neighbor_sum) / (1.0 + alpha * float(degree))
+        return z
 
     def forward(self, x: torch.Tensor, K_steps: int = 3, use_triton: bool = False) -> torch.Tensor:
         bsz, n_tokens, d_dim = x.shape
@@ -228,6 +271,8 @@ class ContinuousSpatialSSM_V12(nn.Module):
                     k3 = self._rhs(h + 0.5 * dt * k2, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
                     k4 = self._rhs(h + dt * k3, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
                     h_next = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                elif self.integrator == "imex":
+                    h_next = self._imex_step(h, dt, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
                 else:
                     raise RuntimeError(f"Unsupported integrator={self.integrator!r}")
                 h = self._recurrence_activation(h_next)
@@ -246,6 +291,7 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
         spatial_op: str = "laplacian",
         recurrence_nonlinearity: str = "identity",
         integrator: str = "euler",
+        imex_iters: int = 3,
     ):
         super().__init__()
         d_inner = int(expand * d_model)
@@ -265,6 +311,7 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
             spatial_op=spatial_op,
             recurrence_nonlinearity=recurrence_nonlinearity,
             integrator=integrator,
+            imex_iters=imex_iters,
         )
         self.norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
@@ -305,12 +352,14 @@ class ContinuousSpatialMambaClassifier_V12(nn.Module):
         self.spatial_op = getattr(cfg, "spatial_op", "laplacian")
         self.recurrence_nonlinearity = getattr(cfg, "recurrence_nonlinearity", "identity")
         self.integrator = getattr(cfg, "integrator", "euler")
+        self.imex_iters = getattr(cfg, "imex_iters", 3)
         self.blocks = nn.ModuleList([
             ContinuousSpatialMambaBlock_V12(
                 cfg.d_embed,
                 spatial_op=self.spatial_op,
                 recurrence_nonlinearity=self.recurrence_nonlinearity,
                 integrator=self.integrator,
+                imex_iters=self.imex_iters,
             )
             for _ in range(cfg.n_mamba_layers)
         ])
