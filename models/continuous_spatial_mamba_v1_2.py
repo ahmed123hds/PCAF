@@ -218,6 +218,9 @@ class ContinuousSpatialSSM_V12(nn.Module):
         if self.spatial_op not in {"laplacian", "laplacian8"}:
             raise RuntimeError("IMEX integrator is only supported for laplacian and laplacian8.")
 
+        # This is the linear implicit diffusion solve. The configured recurrence
+        # nonlinearity is applied once after the solve in forward(), matching the
+        # other integrators' post-step activation semantics.
         rhs = h + dt * delta_s_spatial * (A.view(1, -1, 1, 1) * h + h0_spatial)
         alpha = dt * delta_d_spatial * D_phys.view(1, -1, 1, 1)
         z = rhs
@@ -234,7 +237,11 @@ class ContinuousSpatialSSM_V12(nn.Module):
 
         A = -F.softplus(self.A_log)
         delta_self = torch.clamp(F.softplus(self.dt_self_proj(x)), max=0.15)
-        delta_diff = torch.clamp(F.softplus(self.dt_diff_proj(x)), max=0.15)
+        delta_diff_raw = F.softplus(self.dt_diff_proj(x))
+        if self.integrator == "imex":
+            delta_diff = delta_diff_raw
+        else:
+            delta_diff = torch.clamp(delta_diff_raw, max=0.15)
 
         h0 = x * torch.tanh(self.B_proj(x))
         D_phys = torch.sigmoid(self.diffusivity_raw) * 0.5
@@ -277,7 +284,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
                     h_next = h + dt * self._rhs(h, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
                 elif self.integrator == "heun":
                     k1 = self._rhs(h, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
-                    h_pred = self._recurrence_activation(h + dt * k1)
+                    h_pred = h + dt * k1
                     k2 = self._rhs(h_pred, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
                     h_next = h + 0.5 * dt * (k1 + k2)
                 elif self.integrator == "rk4":
