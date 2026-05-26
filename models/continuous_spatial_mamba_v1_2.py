@@ -68,6 +68,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
         expand: int = 2,
         spatial_op: str = "laplacian",
         recurrence_nonlinearity: str = "identity",
+        integrator: str = "euler",
     ):
         super().__init__()
         self.d_model = d_model
@@ -77,8 +78,11 @@ class ContinuousSpatialSSM_V12(nn.Module):
             raise ValueError(f"Unsupported spatial_op={spatial_op!r}")
         if recurrence_nonlinearity not in {"identity", "silu", "tanh", "gelu", "relu6", "relu"}:
             raise ValueError(f"Unsupported recurrence_nonlinearity={recurrence_nonlinearity!r}")
+        if integrator not in {"euler", "heun", "rk4"}:
+            raise ValueError(f"Unsupported integrator={integrator!r}")
         self.spatial_op = spatial_op
         self.recurrence_nonlinearity = recurrence_nonlinearity
+        self.integrator = integrator
 
         self.dt_self_proj = nn.Linear(d_inner, d_inner, bias=True)
         self.dt_diff_proj = nn.Linear(d_inner, d_inner, bias=True)
@@ -165,6 +169,20 @@ class ContinuousSpatialSSM_V12(nn.Module):
             return F.relu(x)
         raise RuntimeError(f"Unsupported recurrence_nonlinearity={self.recurrence_nonlinearity!r}")
 
+    def _rhs(
+        self,
+        h: torch.Tensor,
+        delta_s_spatial: torch.Tensor,
+        delta_d_spatial: torch.Tensor,
+        A: torch.Tensor,
+        h0_spatial: torch.Tensor,
+        D_phys: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            delta_s_spatial * (A.view(1, -1, 1, 1) * h + h0_spatial)
+            + delta_d_spatial * D_phys.view(1, -1, 1, 1) * self._spatial_mix(h)
+        )
+
     def forward(self, x: torch.Tensor, K_steps: int = 3, use_triton: bool = False) -> torch.Tensor:
         bsz, n_tokens, d_dim = x.shape
         del bsz
@@ -178,7 +196,14 @@ class ContinuousSpatialSSM_V12(nn.Module):
         h0 = x * torch.tanh(self.B_proj(x))
         D_phys = torch.sigmoid(self.diffusivity_raw) * 0.5
 
-        if use_triton and x.is_cuda and self.spatial_op == "laplacian":
+        use_fast_triton = (
+            use_triton
+            and x.is_cuda
+            and self.spatial_op == "laplacian"
+            and self.recurrence_nonlinearity == "identity"
+            and self.integrator == "euler"
+        )
+        if use_fast_triton:
             from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_cuda
             h = cs_scan_v12_cuda(h0, delta_self, delta_diff, A, D_phys, K_steps, H, W)
         else:
@@ -188,14 +213,24 @@ class ContinuousSpatialSSM_V12(nn.Module):
             delta_d_spatial = delta_diff.transpose(1, 2).unflatten(2, (H, W))
 
             dt = 1.0 / K_steps
-            self_coeff = 1.0 + dt * delta_s_spatial * A.view(1, d_dim, 1, 1)
-            input_term = dt * delta_s_spatial * h0_spatial
-            diff_coeff = dt * delta_d_spatial * D_phys.view(1, d_dim, 1, 1)
 
             for _ in range(K_steps):
-                h = self._recurrence_activation(
-                    h * self_coeff + input_term + diff_coeff * self._spatial_mix(h)
-                )
+                if self.integrator == "euler":
+                    h_next = h + dt * self._rhs(h, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                elif self.integrator == "heun":
+                    k1 = self._rhs(h, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    h_pred = self._recurrence_activation(h + dt * k1)
+                    k2 = self._rhs(h_pred, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    h_next = h + 0.5 * dt * (k1 + k2)
+                elif self.integrator == "rk4":
+                    k1 = self._rhs(h, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    k2 = self._rhs(h + 0.5 * dt * k1, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    k3 = self._rhs(h + 0.5 * dt * k2, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    k4 = self._rhs(h + dt * k3, delta_s_spatial, delta_d_spatial, A, h0_spatial, D_phys)
+                    h_next = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                else:
+                    raise RuntimeError(f"Unsupported integrator={self.integrator!r}")
+                h = self._recurrence_activation(h_next)
 
             h = h.flatten(2).transpose(1, 2)
 
@@ -210,6 +245,7 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
         expand: int = 2,
         spatial_op: str = "laplacian",
         recurrence_nonlinearity: str = "identity",
+        integrator: str = "euler",
     ):
         super().__init__()
         d_inner = int(expand * d_model)
@@ -228,6 +264,7 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
             expand=expand,
             spatial_op=spatial_op,
             recurrence_nonlinearity=recurrence_nonlinearity,
+            integrator=integrator,
         )
         self.norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
@@ -267,11 +304,13 @@ class ContinuousSpatialMambaClassifier_V12(nn.Module):
         )
         self.spatial_op = getattr(cfg, "spatial_op", "laplacian")
         self.recurrence_nonlinearity = getattr(cfg, "recurrence_nonlinearity", "identity")
+        self.integrator = getattr(cfg, "integrator", "euler")
         self.blocks = nn.ModuleList([
             ContinuousSpatialMambaBlock_V12(
                 cfg.d_embed,
                 spatial_op=self.spatial_op,
                 recurrence_nonlinearity=self.recurrence_nonlinearity,
+                integrator=self.integrator,
             )
             for _ in range(cfg.n_mamba_layers)
         ])

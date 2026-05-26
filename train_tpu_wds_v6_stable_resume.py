@@ -159,6 +159,8 @@ def parse_args():
                    choices=["identity", "silu", "tanh", "gelu", "relu6", "relu"],
                    default="identity",
                    help="V1.2 activation applied after each recurrence step")
+    p.add_argument("--integrator", choices=["euler", "heun", "rk4"], default="euler",
+                   help="V1.2 recurrence integrator")
     p.add_argument("--n_flow_groups", type=int, default=8, help="Number of flow groups for transport")
 
     # Optimizer
@@ -572,6 +574,7 @@ def _mp_fn(index, flags):
     cfg.drop_path = flags.drop_path
     cfg.spatial_op = flags.spatial_op
     cfg.recurrence_nonlinearity = flags.recurrence_nonlinearity
+    cfg.integrator = flags.integrator
     cfg.n_flow_groups = flags.n_flow_groups
 
     if flags.model_version == "v1":
@@ -579,7 +582,7 @@ def _mp_fn(index, flags):
         model_name = "CS-Mamba V1 (Continuous Spatial)"
     elif flags.model_version == "v1_2":
         model = CSMamba_V12(cfg).to(device)
-        model_name = f"CS-Mamba V1.2 ({flags.spatial_op}, {flags.recurrence_nonlinearity} 3D Continuous Spatial)"
+        model_name = f"CS-Mamba V1.2 ({flags.spatial_op}, {flags.recurrence_nonlinearity}, {flags.integrator} 3D Continuous Spatial)"
     elif flags.model_version == "vmamba":
         model = VMamba4D(cfg).to(device)
         model_name = "VMamba4D (TPU-safe Cross-Scan)"

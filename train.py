@@ -512,6 +512,9 @@ def parse_args():
     p.add_argument('--recurrence_nonlinearity', default='identity',
                    choices=['identity', 'silu', 'tanh', 'gelu', 'relu6', 'relu'],
                    help="V1.2 activation applied after each recurrence step")
+    p.add_argument('--integrator', default='euler',
+                   choices=['euler', 'heun', 'rk4'],
+                   help="V1.2 recurrence integrator")
     p.add_argument('--use_triton', action='store_true',
                    help="Use custom CUDA/Triton scan kernels for supported models")
     p.add_argument('--compile', action='store_true',
@@ -580,7 +583,7 @@ def main():
     if cfg.mode in ('spatial_v12', 'spatial_v12_vmamba'):
         setattr(cfg, 'canvas_size', cfg.img_size) # for compatibility
         model_s12 = CSMambaV12CIFAR(cfg).to(device)
-        v12_name = f"CSMamba_V1_2_{cfg.spatial_op}_{cfg.recurrence_nonlinearity}"
+        v12_name = f"CSMamba_V1_2_{cfg.spatial_op}_{cfg.recurrence_nonlinearity}_{cfg.integrator}"
         results[v12_name] = train_model(v12_name, model_s12, cfg, device)
 
     if cfg.mode in ('vmamba', 'spatial_vmamba', 'spatial_v12_vmamba', 'all'):
