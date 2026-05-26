@@ -28,6 +28,7 @@ _ACT_TO_ID = {
     "tanh": 2,
     "relu6": 3,
     "relu": 4,
+    "gelu": 5,
 }
 
 
@@ -50,6 +51,8 @@ def _v12_apply_activation(x, ACT: tl.constexpr):
         return tl.minimum(tl.maximum(x, 0.0), 6.0)
     if ACT == 4:
         return tl.maximum(x, 0.0)
+    if ACT == 5:
+        return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
     return x
 
 
@@ -64,9 +67,13 @@ def _v12_activation_grad(x, ACT: tl.constexpr):
         t = 2.0 * tl.sigmoid(2.0 * x) - 1.0
         return 1.0 - t * t
     if ACT == 3:
-        return (x > 0.0) & (x < 6.0)
+        return tl.where((x > 0.0) & (x < 6.0), 1.0, 0.0)
     if ACT == 4:
-        return x > 0.0
+        return tl.where(x > 0.0, 1.0, 0.0)
+    if ACT == 5:
+        cdf = 0.5 * (1.0 + tl.erf(x * 0.7071067811865476))
+        pdf_x = 0.3989422804014327 * x * tl.exp(-0.5 * x * x)
+        return cdf + pdf_x
     return x * 0.0 + 1.0
 
 
@@ -80,6 +87,7 @@ def _v12_forward_step_flex_kernel(
     DPHYS_PTR,
     OUT_PTR,
     SAVE_PTR,
+    PREACT_PTR,
     DT: tl.constexpr,
     STEP: tl.constexpr,
     B: tl.constexpr,
@@ -137,12 +145,14 @@ def _v12_forward_step_flex_kernel(
 
     tl.store(OUT_PTR + base, out, mask=mask)
     tl.store(SAVE_PTR + STEP * B * N * D + base, h, mask=mask)
+    tl.store(PREACT_PTR + STEP * B * N * D + base, pre, mask=mask)
 
 
 @triton.jit
 def _v12_backward_step_flex_kernel(
     G_PTR,
     H_STATE_PTR,
+    PREACT_PTR,
     H0_PTR,
     DS_PTR,
     DD_PTR,
@@ -196,7 +206,17 @@ def _v12_backward_step_flex_kernel(
     g_bot = tl.load(G_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
     g_left = tl.load(G_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
     g_right = tl.load(G_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
-    g_neighbor_sum = g_top + g_bot + g_left + g_right
+    pre = tl.load(PREACT_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    pre_top = tl.load(PREACT_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+    pre_bot = tl.load(PREACT_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+    pre_left = tl.load(PREACT_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+    pre_right = tl.load(PREACT_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+
+    gp = g * _v12_activation_grad(pre, ACT)
+    gp_top = g_top * _v12_activation_grad(pre_top, ACT)
+    gp_bot = g_bot * _v12_activation_grad(pre_bot, ACT)
+    gp_left = g_left * _v12_activation_grad(pre_left, ACT)
+    gp_right = g_right * _v12_activation_grad(pre_right, ACT)
 
     ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
     dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
@@ -220,7 +240,14 @@ def _v12_backward_step_flex_kernel(
         g_tr = tl.load(G_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
         g_bl = tl.load(G_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
         g_br = tl.load(G_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
-        g_neighbor_sum += g_tl + g_tr + g_bl + g_br
+        pre_tl = tl.load(PREACT_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+        pre_tr = tl.load(PREACT_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+        pre_bl = tl.load(PREACT_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+        pre_br = tl.load(PREACT_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        gp_tl = g_tl * _v12_activation_grad(pre_tl, ACT)
+        gp_tr = g_tr * _v12_activation_grad(pre_tr, ACT)
+        gp_bl = g_bl * _v12_activation_grad(pre_bl, ACT)
+        gp_br = g_br * _v12_activation_grad(pre_br, ACT)
 
         dd_tl = tl.load(DD_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
         dd_tr = tl.load(DD_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
@@ -229,15 +256,13 @@ def _v12_backward_step_flex_kernel(
         degree = 8.0
 
     lap_h = h_neighbor_sum - degree * h
-    pre = h + DT * (ds * (a * h + h0) + dd * dphys * lap_h)
-    gp = g * _v12_activation_grad(pre, ACT)
 
     r = DT * dd * dphys * gp
     r_sum = DT * dphys * (
-        dd_top * g_top + dd_bot * g_bot + dd_left * g_left + dd_right * g_right
+        dd_top * gp_top + dd_bot * gp_bot + dd_left * gp_left + dd_right * gp_right
     )
     if STENCIL == 8:
-        r_sum += DT * dphys * (dd_tl * g_tl + dd_tr * g_tr + dd_bl * g_bl + dd_br * g_br)
+        r_sum += DT * dphys * (dd_tl * gp_tl + dd_tr * gp_tr + dd_bl * gp_bl + dd_br * gp_br)
     lap_r = r_sum - degree * r
 
     g_prev = gp * (1.0 + DT * ds * a) + lap_r
@@ -486,10 +511,8 @@ def cs_scan_v12_forward_flex_cuda(
     stencil: int = 4,
     activation: str = "identity",
     block_d: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
-    if activation != "identity":
-        raise ValueError("Triton V1.2 flexible training path currently supports identity activation only.")
     if stencil not in {4, 8}:
         raise ValueError(f"Unsupported stencil={stencil}; expected 4 or 8.")
     h0 = h0.contiguous()
@@ -510,6 +533,7 @@ def cs_scan_v12_forward_flex_cuda(
     work_a = torch.empty_like(h)
     work_b = torch.empty_like(h)
     states = torch.empty((K, bsz, n_tokens, d_dim), device=h.device, dtype=h.dtype)
+    preacts = torch.empty_like(states)
     grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
     dt = 1.0 / float(K)
     act_id = _activation_id(activation)
@@ -525,6 +549,7 @@ def cs_scan_v12_forward_flex_cuda(
             D_phys_flat,
             h_next,
             states,
+            preacts,
             DT=dt,
             STEP=step,
             B=bsz,
@@ -539,7 +564,7 @@ def cs_scan_v12_forward_flex_cuda(
         )
         h = h_next
 
-    return h, states
+    return h, states, preacts
 
 
 def cs_scan_v12_backward_cuda(
@@ -627,6 +652,7 @@ def cs_scan_v12_backward_cuda(
 def cs_scan_v12_backward_flex_cuda(
     grad_output: torch.Tensor,
     states: torch.Tensor,
+    preacts: torch.Tensor,
     h0: torch.Tensor,
     delta_s: torch.Tensor,
     delta_d: torch.Tensor,
@@ -640,13 +666,12 @@ def cs_scan_v12_backward_flex_cuda(
     activation: str = "identity",
     block_d: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    _require_triton_cuda(grad_output, states, h0, delta_s, delta_d, A, D_phys)
-    if activation != "identity":
-        raise ValueError("Triton V1.2 flexible training path currently supports identity activation only.")
+    _require_triton_cuda(grad_output, states, preacts, h0, delta_s, delta_d, A, D_phys)
     if stencil not in {4, 8}:
         raise ValueError(f"Unsupported stencil={stencil}; expected 4 or 8.")
     grad_output = grad_output.contiguous()
     states = states.contiguous()
+    preacts = preacts.contiguous()
     h0 = h0.contiguous()
     delta_s = delta_s.contiguous()
     delta_d = delta_d.contiguous()
@@ -670,6 +695,7 @@ def cs_scan_v12_backward_flex_cuda(
         _v12_backward_step_flex_kernel[grid](
             g,
             states[step],
+            preacts[step],
             h0,
             delta_s,
             delta_d,
@@ -710,7 +736,7 @@ def cs_scan_v12_backward_flex_cuda(
 class CSScanV12FlexFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation):
-        h, states = cs_scan_v12_forward_flex_cuda(
+        h, states, preacts = cs_scan_v12_forward_flex_cuda(
             h0,
             delta_s,
             delta_d,
@@ -722,7 +748,7 @@ class CSScanV12FlexFunction(torch.autograd.Function):
             stencil=int(stencil),
             activation=str(activation),
         )
-        ctx.save_for_backward(states, h0, delta_s, delta_d, A, D_phys)
+        ctx.save_for_backward(states, preacts, h0, delta_s, delta_d, A, D_phys)
         ctx.K = int(K)
         ctx.H = int(H)
         ctx.W = int(W)
@@ -732,10 +758,11 @@ class CSScanV12FlexFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        states, h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
+        states, preacts, h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
         grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys = cs_scan_v12_backward_flex_cuda(
             grad_output,
             states,
+            preacts,
             h0,
             delta_s,
             delta_d,
