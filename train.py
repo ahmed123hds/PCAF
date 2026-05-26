@@ -406,7 +406,7 @@ def train_model(name, model, cfg, device):
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
         betas=(0.9, 0.999))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.epochs)
+        optimizer, T_max=cfg.epochs, eta_min=cfg.min_lr)
 
     # Mixed precision only if CUDA available
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
@@ -526,6 +526,7 @@ def parse_args():
     p.add_argument('--epochs',       type=int,   default=30)
     p.add_argument('--batch_size',   type=int,   default=128)
     p.add_argument('--lr',           type=float, default=3e-4)
+    p.add_argument('--min_lr',       type=float, default=0.0)
     p.add_argument('--weight_decay', type=float, default=1e-4)
 
     p.add_argument('--seed', type=int, default=42)
