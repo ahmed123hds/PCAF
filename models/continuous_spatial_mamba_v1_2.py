@@ -242,13 +242,28 @@ class ContinuousSpatialSSM_V12(nn.Module):
         use_fast_triton = (
             use_triton
             and x.is_cuda
-            and self.spatial_op == "laplacian"
+            and self.spatial_op in {"laplacian", "laplacian8"}
             and self.recurrence_nonlinearity == "identity"
             and self.integrator == "euler"
         )
         if use_fast_triton:
-            from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_cuda
-            h = cs_scan_v12_cuda(h0, delta_self, delta_diff, A, D_phys, K_steps, H, W)
+            if self.spatial_op == "laplacian":
+                from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_cuda
+                h = cs_scan_v12_cuda(h0, delta_self, delta_diff, A, D_phys, K_steps, H, W)
+            else:
+                from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_flex_cuda
+                h = cs_scan_v12_flex_cuda(
+                    h0,
+                    delta_self,
+                    delta_diff,
+                    A,
+                    D_phys,
+                    K_steps,
+                    H,
+                    W,
+                    stencil=8,
+                    activation=self.recurrence_nonlinearity,
+                )
         else:
             h = h0.transpose(1, 2).unflatten(2, (H, W))
             h0_spatial = h
