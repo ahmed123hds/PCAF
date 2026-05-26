@@ -126,7 +126,7 @@ def _torch_reference_integrator_scan(
     for _ in range(K):
         if integrator == "heun":
             k1 = rhs(h)
-            pred = h + dt * k1
+            pred = _torch_activation(h + dt * k1, activation)
             k2 = rhs(pred)
             h_next = h + 0.5 * dt * (k1 + k2)
         elif integrator == "rk4":
@@ -501,6 +501,209 @@ def _v12_imex_jacobi_kernel(
     alpha = DT * dd * dphys
     out = (rhs + alpha * neighbor_sum) / (1.0 + alpha * degree)
     tl.store(OUT_PTR + base, _v12_apply_activation(out, ACT), mask=mask)
+
+
+@triton.jit
+def _v12_imex_jacobi_bwd_elem_kernel(
+    GZ_PTR,          # Input gradient (B, N, D)
+    Z_PREV_PTR,      # Forward state z^(j) (B, N, D)
+    Z_CURR_PTR,      # Forward state z^(j+1) (B, N, D)
+    DD_PTR,          # delta_d (B, N, D)
+    DPHYS_PTR,       # D_phys (D,)
+    Q_PTR,           # Intermediate scaled output gradient (B, N, D)
+    GRHS_ACC_PTR,    # Accumulator for rhs gradient (B, N, D)
+    GDELTA_D_PTR,    # Gradient accumulator for delta_d (B, N, D)
+    GDPHYS_PTR,      # Gradient accumulator for D_phys (D,)
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+
+    base = (b * N + n) * D + d
+
+    gz = tl.load(GZ_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    z_prev = tl.load(Z_PREV_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    z_curr = tl.load(Z_CURR_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    alpha = DT * dd * dphys
+
+    degree = 4.0
+    z_prev_sum = (
+        tl.load(Z_PREV_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PREV_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PREV_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PREV_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+
+    if STENCIL == 8:
+        n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+        n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+        n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+        n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+        z_prev_sum += (
+            tl.load(Z_PREV_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PREV_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PREV_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PREV_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        degree = 8.0
+
+    denom = 1.0 + alpha * degree
+    
+    # 1. Scale input gradient for spatial propagation: q = (alpha * gz) / (1 + alpha * degree)
+    q = (alpha * gz) / denom
+    tl.store(Q_PTR + base, q, mask=mask)
+
+    # 2. Accumulate to RHS gradient: grhs += gz / (1 + alpha * degree)
+    old_grhs = tl.load(GRHS_ACC_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GRHS_ACC_PTR + base, old_grhs + (gz / denom), mask=mask)
+
+    # 3. Parameter gradients
+    g_alpha = gz * (z_prev_sum - degree * z_curr) / denom
+
+    old_gdd = tl.load(GDELTA_D_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GDELTA_D_PTR + base, old_gdd + g_alpha * DT * dphys, mask=mask)
+
+    tl.atomic_add(GDPHYS_PTR + d, g_alpha * DT * dd, sem="relaxed", mask=mask)
+
+
+@triton.jit
+def _v12_imex_jacobi_bwd_spatial_kernel(
+    Q_PTR,           # Scaled input gradient (B, N, D)
+    GZ_NEXT_PTR,     # Output gradient for next iter (B, N, D)
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+
+    base = (b * N + n) * D + d
+
+    # Adjoint spatial neighbor sum of q
+    q_sum = (
+        tl.load(Q_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Q_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Q_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Q_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+
+    if STENCIL == 8:
+        n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+        n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+        n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+        n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+        q_sum += (
+            tl.load(Q_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Q_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Q_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Q_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+
+    tl.store(GZ_NEXT_PTR + base, q_sum, mask=mask)
+
+
+@triton.jit
+def _v12_imex_rhs_bwd_kernel(
+    GRHS_PTR,        # Gradient with respect to rhs (B, N, D)
+    H_PTR,           # Hidden state input to step h^(k) (B, N, D)
+    H0_PTR,          # input projection h0 (B, N, D)
+    DS_PTR,          # delta_s (B, N, D)
+    A_PTR,           # A (D,)
+    G_PREV_PTR,      # Output gradient for input state h^(k) (B, N, D)
+    GDS_PTR,         # Gradient accumulator for delta_s (B, N, D)
+    GH0_PTR,         # Gradient accumulator for h0 (B, N, D)
+    GA_PTR,          # Gradient accumulator for A (D,)
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+
+    base = (b * N + n) * D + d
+
+    grhs = tl.load(GRHS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h = tl.load(H_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+
+    g_prev = grhs * (1.0 + DT * ds * a)
+    tl.store(G_PREV_PTR + base, g_prev, mask=mask)
+
+    old_gh0 = tl.load(GH0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GH0_PTR + base, old_gh0 + grhs * DT * ds, mask=mask)
+
+    old_gds = tl.load(GDS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GDS_PTR + base, old_gds + grhs * DT * (a * h + h0), mask=mask)
+
+    tl.atomic_add(GA_PTR + d, grhs * DT * ds * h, sem="relaxed", mask=mask)
+
+
+@triton.jit
+def _v12_imex_act_bwd_kernel(
+    G_PTR,          # incoming gradient (B, N, D)
+    PREACT_PTR,     # preacts (B, N, D)
+    G_PREACT_PTR,   # Output pre-activation gradient (B, N, D)
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ACT: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+
+    base = (b * N + n) * D + d
+    g = tl.load(G_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    pre = tl.load(PREACT_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    g_pre = g * _v12_activation_grad(pre, ACT)
+    tl.store(G_PREACT_PTR + base, g_pre, mask=mask)
 
 
 @triton.jit
@@ -1223,6 +1426,8 @@ def cs_scan_v12_forward_integrator_cuda(
                 STENCIL=int(stencil),
                 num_warps=4,
             )
+            # Apply activation to predictor (matching PyTorch model's Heun behavior)
+            pred = _torch_activation(pred, activation)
             _v12_heun_finish_kernel[grid](
                 h,
                 pred,
@@ -1372,6 +1577,293 @@ def cs_scan_v12_forward_integrator_cuda(
             raise RuntimeError(f"Unsupported integrator={integrator!r}")
 
     return h
+
+
+def cs_scan_v12_forward_imex_cuda(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    imex_iters: int = 3,
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
+    if stencil not in {4, 8}:
+        raise ValueError(f"Unsupported stencil={stencil}; expected 4 or 8.")
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    if n_tokens != H * W:
+        raise ValueError(f"H*W={H * W} does not match N={n_tokens}.")
+    if A.numel() != d_dim:
+        raise ValueError(f"A has {A.numel()} values, expected {d_dim}.")
+    if D_phys_flat.numel() != d_dim:
+        raise ValueError(f"D_phys has {D_phys_flat.numel()} values, expected {d_dim}.")
+
+    h = h0
+    states = torch.empty((K, bsz, n_tokens, d_dim), device=h.device, dtype=h.dtype)
+    preacts = torch.empty_like(states)
+    jacobi_states = torch.empty((K, imex_iters + 1, bsz, n_tokens, d_dim), device=h.device, dtype=h.dtype)
+
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+    act_id = _activation_id(activation)
+
+    for step in range(K):
+        rhs = jacobi_states[step, 0]
+        _v12_imex_rhs_kernel[grid](
+            h,
+            h0,
+            delta_s,
+            A,
+            rhs,
+            DT=dt,
+            B=bsz,
+            N=n_tokens,
+            D=d_dim,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+
+        z = rhs
+        n_iters = max(1, int(imex_iters))
+        for jacobi_iter in range(n_iters):
+            z_next = jacobi_states[step, jacobi_iter + 1]
+            _v12_imex_jacobi_kernel[grid](
+                rhs,
+                z,
+                delta_d,
+                D_phys_flat,
+                z_next,
+                DT=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                ACT=0,
+                num_warps=4,
+            )
+            z = z_next
+
+        preacts[step].copy_(z)
+        h_next = states[step]
+        h_next.copy_(_torch_activation(z, activation))
+        h = h_next
+
+    return h, states, preacts, jacobi_states
+
+
+def cs_scan_v12_backward_imex_cuda(
+    grad_output: torch.Tensor,
+    states: torch.Tensor,
+    preacts: torch.Tensor,
+    jacobi_states: torch.Tensor,
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    imex_iters: int = 3,
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(grad_output, states, preacts, jacobi_states, h0, delta_s, delta_d, A, D_phys)
+    grad_output = grad_output.contiguous()
+    states = states.contiguous()
+    preacts = preacts.contiguous()
+    jacobi_states = jacobi_states.contiguous()
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    g = grad_output
+    g_prev = torch.empty_like(g)
+
+    grad_h0_input = torch.zeros_like(h0)
+    grad_delta_s = torch.zeros_like(delta_s)
+    grad_delta_d = torch.zeros_like(delta_d)
+    grad_A = torch.zeros_like(A)
+    grad_D_phys_flat = torch.zeros_like(D_phys_flat)
+
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+    act_id = _activation_id(activation)
+
+    for step in range(K - 1, -1, -1):
+        g_pre = torch.empty_like(g)
+        _v12_imex_act_bwd_kernel[grid](
+            g,
+            preacts[step],
+            g_pre,
+            B=bsz,
+            N=n_tokens,
+            D=d_dim,
+            BLOCK_D=block_d,
+            ACT=act_id,
+            num_warps=4,
+        )
+
+        gz = g_pre
+        rhs_grad = torch.zeros_like(gz)
+        q = torch.empty_like(gz)
+        for jacobi_iter in range(imex_iters - 1, -1, -1):
+            gz_next = torch.empty_like(gz)
+            _v12_imex_jacobi_bwd_elem_kernel[grid](
+                gz,
+                jacobi_states[step, jacobi_iter],
+                jacobi_states[step, jacobi_iter + 1],
+                delta_d,
+                D_phys_flat,
+                q,
+                rhs_grad,
+                grad_delta_d,
+                grad_D_phys_flat,
+                DT=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            _v12_imex_jacobi_bwd_spatial_kernel[grid](
+                q,
+                gz_next,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            gz = gz_next
+
+        rhs_grad.add_(gz)
+
+        h_in = states[step - 1] if step > 0 else h0
+        _v12_imex_rhs_bwd_kernel[grid](
+            rhs_grad,
+            h_in,
+            h0,
+            delta_s,
+            A,
+            g_prev,
+            grad_delta_s,
+            grad_h0_input,
+            grad_A,
+            DT=dt,
+            B=bsz,
+            N=n_tokens,
+            D=d_dim,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+        g = g_prev
+
+    grad_h0 = grad_h0_input + g
+    return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat.reshape_as(D_phys)
+
+
+class CSScanV12IMEXFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation, imex_iters):
+        h, states, preacts, jacobi_states = cs_scan_v12_forward_imex_cuda(
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            int(K),
+            int(H),
+            int(W),
+            stencil=int(stencil),
+            activation=str(activation),
+            imex_iters=int(imex_iters),
+        )
+        ctx.save_for_backward(states, preacts, jacobi_states, h0, delta_s, delta_d, A, D_phys)
+        ctx.K = int(K)
+        ctx.H = int(H)
+        ctx.W = int(W)
+        ctx.stencil = int(stencil)
+        ctx.activation = str(activation)
+        ctx.imex_iters = int(imex_iters)
+        return h
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        states, preacts, jacobi_states, h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
+        grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys = cs_scan_v12_backward_imex_cuda(
+            grad_output,
+            states,
+            preacts,
+            jacobi_states,
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            ctx.K,
+            ctx.H,
+            ctx.W,
+            stencil=ctx.stencil,
+            activation=ctx.activation,
+            imex_iters=ctx.imex_iters,
+        )
+        return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys, None, None, None, None, None, None
+
+
+def cs_scan_v12_imex_cuda(
+    h0,
+    delta_s,
+    delta_d,
+    A,
+    D_phys,
+    K,
+    H,
+    W,
+    stencil=4,
+    activation="identity",
+    imex_iters=3,
+):
+    return CSScanV12IMEXFunction.apply(
+        h0,
+        delta_s,
+        delta_d,
+        A,
+        D_phys,
+        K,
+        H,
+        W,
+        int(stencil),
+        str(activation),
+        int(imex_iters),
+    )
 
 
 class CSScanV12IntegratorFunction(torch.autograd.Function):

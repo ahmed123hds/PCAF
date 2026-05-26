@@ -270,6 +270,21 @@ class ContinuousSpatialSSM_V12(nn.Module):
                     stencil=8 if self.spatial_op == "laplacian8" else 4,
                     activation=self.recurrence_nonlinearity,
                 )
+            elif self.integrator == "imex":
+                from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_imex_cuda
+                h = cs_scan_v12_imex_cuda(
+                    h0,
+                    delta_self,
+                    delta_diff,
+                    A,
+                    D_phys,
+                    K_steps,
+                    H,
+                    W,
+                    stencil=8 if self.spatial_op == "laplacian8" else 4,
+                    activation=self.recurrence_nonlinearity,
+                    imex_iters=self.imex_iters,
+                )
             else:
                 from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_integrator_cuda
                 h = cs_scan_v12_integrator_cuda(

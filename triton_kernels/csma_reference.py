@@ -191,15 +191,17 @@ def cs_mamba_backward_reference(
 
         # ── Adjoint recurrence: g^(k) = g^(k+1) + dt * ∂F/∂h^T · g^(k+1) ──
         # ∂F/∂h = Δ_self ⊙ A  (pointwise)
-        #       + Δ_diff ⊙ D_phys · ∇² (self-adjoint, same stencil)
+        #       + ∇²(Δ_diff ⊙ D_phys · g)  (diffusion adjoint)
         g_pointwise = g * delta_s.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
 
-        # Laplacian of g (self-adjoint: L^T = L)
-        g_collapsed = g.sum(dim=-1)
-        g_2d = g_collapsed.transpose(1, 2).reshape(B_val, D_dim, H, W)
-        lap_g_2d = laplacian_2d_neumann(g_2d)
-        lap_g = lap_g_2d.reshape(B_val, D_dim, N).transpose(1, 2)
-        g_diffusion = delta_d.unsqueeze(-1) * D_coeff * lap_g.unsqueeze(-1)
+        # Adjoint of diffusion: ∇²(delta_d · D_phys · g), NOT delta_d · D_phys · ∇²(g).
+        # When delta_d varies spatially, the product must be inside the Laplacian.
+        r = delta_d.unsqueeze(-1) * D_coeff * g       # (B, N, D, S)
+        r_collapsed = r.sum(dim=-1)                    # (B, N, D)
+        r_2d = r_collapsed.transpose(1, 2).reshape(B_val, D_dim, H, W)
+        lap_r_2d = laplacian_2d_neumann(r_2d)
+        lap_r = lap_r_2d.reshape(B_val, D_dim, N).transpose(1, 2)
+        g_diffusion = lap_r.unsqueeze(-1)              # (B, N, D, S)
 
         g = g + dt * (g_pointwise + g_diffusion)
 
