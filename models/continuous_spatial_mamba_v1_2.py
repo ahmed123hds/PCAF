@@ -250,13 +250,13 @@ class ContinuousSpatialSSM_V12(nn.Module):
             use_triton
             and x.is_cuda
             and self.spatial_op in {"laplacian", "laplacian8"}
-            and self.integrator == "euler"
+            and self.integrator in {"euler", "heun", "rk4", "imex"}
         )
         if use_fast_triton:
-            if self.spatial_op == "laplacian" and self.recurrence_nonlinearity == "identity":
+            if self.integrator == "euler" and self.spatial_op == "laplacian" and self.recurrence_nonlinearity == "identity":
                 from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_cuda
                 h = cs_scan_v12_cuda(h0, delta_self, delta_diff, A, D_phys, K_steps, H, W)
-            else:
+            elif self.integrator == "euler":
                 from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_flex_cuda
                 h = cs_scan_v12_flex_cuda(
                     h0,
@@ -269,6 +269,22 @@ class ContinuousSpatialSSM_V12(nn.Module):
                     W,
                     stencil=8 if self.spatial_op == "laplacian8" else 4,
                     activation=self.recurrence_nonlinearity,
+                )
+            else:
+                from triton_kernels.csma_triton_scan_v12 import cs_scan_v12_integrator_cuda
+                h = cs_scan_v12_integrator_cuda(
+                    h0,
+                    delta_self,
+                    delta_diff,
+                    A,
+                    D_phys,
+                    K_steps,
+                    H,
+                    W,
+                    stencil=8 if self.spatial_op == "laplacian8" else 4,
+                    activation=self.recurrence_nonlinearity,
+                    integrator=self.integrator,
+                    imex_iters=self.imex_iters,
                 )
         else:
             h = h0.transpose(1, 2).unflatten(2, (H, W))

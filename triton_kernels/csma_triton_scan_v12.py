@@ -39,6 +39,131 @@ def _activation_id(name: str) -> int:
         raise ValueError(f"Triton V1.2 scan does not support recurrence_nonlinearity={name!r}") from exc
 
 
+_INTEGRATOR_TO_ID = {
+    "heun": 1,
+    "rk4": 2,
+    "imex": 3,
+}
+
+
+def _integrator_id(name: str) -> int:
+    try:
+        return _INTEGRATOR_TO_ID[name]
+    except KeyError as exc:
+        raise ValueError(f"Triton V1.2 staged scan does not support integrator={name!r}") from exc
+
+
+def _torch_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    if activation == "identity":
+        return x
+    if activation == "silu":
+        return F.silu(x)
+    if activation == "tanh":
+        return torch.tanh(x)
+    if activation == "gelu":
+        return F.gelu(x)
+    if activation == "relu6":
+        return F.relu6(x)
+    if activation == "relu":
+        return F.relu(x)
+    raise RuntimeError(f"Unsupported activation={activation!r}")
+
+
+def _torch_laplacian(h_2d: torch.Tensor, stencil: int) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    h_pad = F.pad(h_2d, (1, 1, 1, 1), mode="replicate")
+    lap = (
+        h_pad[:, :, 0:-2, 1:-1]
+        + h_pad[:, :, 2:, 1:-1]
+        + h_pad[:, :, 1:-1, 0:-2]
+        + h_pad[:, :, 1:-1, 2:]
+    )
+    if stencil == 8:
+        lap = (
+            lap
+            + h_pad[:, :, 0:-2, 0:-2]
+            + h_pad[:, :, 0:-2, 2:]
+            + h_pad[:, :, 2:, 0:-2]
+            + h_pad[:, :, 2:, 2:]
+            - 8.0 * h_2d
+        )
+    else:
+        lap = lap - 4.0 * h_2d
+    return lap
+
+
+def _torch_reference_integrator_scan(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int,
+    activation: str,
+    integrator: str,
+    imex_iters: int,
+) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    h = h0.transpose(1, 2).unflatten(2, (H, W))
+    h0_spatial = h
+    delta_s_spatial = delta_s.transpose(1, 2).unflatten(2, (H, W))
+    delta_d_spatial = delta_d.transpose(1, 2).unflatten(2, (H, W))
+    a = A.view(1, -1, 1, 1)
+    dphys = D_phys.contiguous().view(1, -1, 1, 1)
+    dt = 1.0 / float(K)
+
+    def rhs(z: torch.Tensor) -> torch.Tensor:
+        return delta_s_spatial * (a * z + h0_spatial) + delta_d_spatial * dphys * _torch_laplacian(z, stencil)
+
+    for _ in range(K):
+        if integrator == "heun":
+            k1 = rhs(h)
+            pred = h + dt * k1
+            k2 = rhs(pred)
+            h_next = h + 0.5 * dt * (k1 + k2)
+        elif integrator == "rk4":
+            k1 = rhs(h)
+            k2 = rhs(h + 0.5 * dt * k1)
+            k3 = rhs(h + 0.5 * dt * k2)
+            k4 = rhs(h + dt * k3)
+            h_next = h + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        elif integrator == "imex":
+            rhs_explicit = h + dt * delta_s_spatial * (a * h + h0_spatial)
+            alpha = dt * delta_d_spatial * dphys
+            z = rhs_explicit
+            degree = 8.0 if stencil == 8 else 4.0
+            for _ in range(imex_iters):
+                h_pad = F.pad(z, (1, 1, 1, 1), mode="replicate")
+                neighbor_sum = (
+                    h_pad[:, :, 0:-2, 1:-1]
+                    + h_pad[:, :, 2:, 1:-1]
+                    + h_pad[:, :, 1:-1, 0:-2]
+                    + h_pad[:, :, 1:-1, 2:]
+                )
+                if stencil == 8:
+                    neighbor_sum = (
+                        neighbor_sum
+                        + h_pad[:, :, 0:-2, 0:-2]
+                        + h_pad[:, :, 0:-2, 2:]
+                        + h_pad[:, :, 2:, 0:-2]
+                        + h_pad[:, :, 2:, 2:]
+                    )
+                z = (rhs_explicit + alpha * neighbor_sum) / (1.0 + alpha * degree)
+            h_next = z
+        else:
+            raise RuntimeError(f"Unsupported integrator={integrator!r}")
+        h = _torch_activation(h_next, activation)
+    return h.flatten(2).transpose(1, 2)
+
+
 @triton.jit
 def _v12_apply_activation(x, ACT: tl.constexpr):
     if ACT == 0:
@@ -75,6 +200,307 @@ def _v12_activation_grad(x, ACT: tl.constexpr):
         pdf_x = 0.3989422804014327 * x * tl.exp(-0.5 * x * x)
         return cdf + pdf_x
     return x * 0.0 + 1.0
+
+
+@triton.jit
+def _v12_stage_kernel(
+    BASE_PTR,
+    EVAL_PTR,
+    H0_PTR,
+    DS_PTR,
+    DD_PTR,
+    A_PTR,
+    DPHYS_PTR,
+    OUT_PTR,
+    DT_SCALE: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+    n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+    n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+    n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+
+    base = (b * N + n) * D + d
+    base_h = tl.load(BASE_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h = tl.load(EVAL_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    neighbor_sum = (
+        tl.load(EVAL_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(EVAL_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(EVAL_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(EVAL_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+    degree = 4.0
+    if STENCIL == 8:
+        neighbor_sum += (
+            tl.load(EVAL_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(EVAL_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(EVAL_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(EVAL_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        degree = 8.0
+
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+
+    lap = neighbor_sum - degree * h
+    rhs = ds * (a * h + h0) + dd * dphys * lap
+    tl.store(OUT_PTR + base, base_h + DT_SCALE * rhs, mask=mask)
+
+
+@triton.jit
+def _v12_heun_finish_kernel(
+    H_PTR,
+    PRED_PTR,
+    H0_PTR,
+    DS_PTR,
+    DD_PTR,
+    A_PTR,
+    DPHYS_PTR,
+    OUT_PTR,
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+    ACT: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+    n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+    n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+    n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+
+    base = (b * N + n) * D + d
+    h = tl.load(H_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    pred = tl.load(PRED_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    h_sum = (
+        tl.load(H_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+    p_sum = (
+        tl.load(PRED_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(PRED_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(PRED_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(PRED_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+    degree = 4.0
+    if STENCIL == 8:
+        h_sum += (
+            tl.load(H_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        p_sum += (
+            tl.load(PRED_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(PRED_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(PRED_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(PRED_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        degree = 8.0
+
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    k1 = ds * (a * h + h0) + dd * dphys * (h_sum - degree * h)
+    k2 = ds * (a * pred + h0) + dd * dphys * (p_sum - degree * pred)
+    pre = h + 0.5 * DT * (k1 + k2)
+    tl.store(OUT_PTR + base, _v12_apply_activation(pre, ACT), mask=mask)
+
+
+@triton.jit
+def _v12_rk4_finish_kernel(
+    H_PTR,
+    H2_PTR,
+    H3_PTR,
+    H4_PTR,
+    H0_PTR,
+    DS_PTR,
+    DD_PTR,
+    A_PTR,
+    DPHYS_PTR,
+    OUT_PTR,
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+    ACT: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+    n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+    n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+    n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+
+    base = (b * N + n) * D + d
+    h = tl.load(H_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h2 = tl.load(H2_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h3 = tl.load(H3_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h4 = tl.load(H4_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    h_sum = tl.load(H_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h2_sum = tl.load(H2_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h3_sum = tl.load(H3_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h4_sum = tl.load(H4_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    degree = 4.0
+    if STENCIL == 8:
+        h_sum += tl.load(H_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h2_sum += tl.load(H2_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h3_sum += tl.load(H3_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h4_sum += tl.load(H4_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        degree = 8.0
+
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    k1 = ds * (a * h + h0) + dd * dphys * (h_sum - degree * h)
+    k2 = ds * (a * h2 + h0) + dd * dphys * (h2_sum - degree * h2)
+    k3 = ds * (a * h3 + h0) + dd * dphys * (h3_sum - degree * h3)
+    k4 = ds * (a * h4 + h0) + dd * dphys * (h4_sum - degree * h4)
+    pre = h + (DT / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    tl.store(OUT_PTR + base, _v12_apply_activation(pre, ACT), mask=mask)
+
+
+@triton.jit
+def _v12_imex_rhs_kernel(
+    H_PTR,
+    H0_PTR,
+    DS_PTR,
+    A_PTR,
+    OUT_PTR,
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    base = (b * N + n) * D + d
+    h = tl.load(H_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    tl.store(OUT_PTR + base, h + DT * ds * (a * h + h0), mask=mask)
+
+
+@triton.jit
+def _v12_imex_jacobi_kernel(
+    RHS_PTR,
+    Z_PTR,
+    DD_PTR,
+    DPHYS_PTR,
+    OUT_PTR,
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+    ACT: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+    n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+    n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+    n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    base = (b * N + n) * D + d
+    rhs = tl.load(RHS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    neighbor_sum = (
+        tl.load(Z_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(Z_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+    degree = 4.0
+    if STENCIL == 8:
+        neighbor_sum += (
+            tl.load(Z_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(Z_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        degree = 8.0
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    alpha = DT * dd * dphys
+    out = (rhs + alpha * neighbor_sum) / (1.0 + alpha * degree)
+    tl.store(OUT_PTR + base, _v12_apply_activation(out, ACT), mask=mask)
 
 
 @triton.jit
@@ -733,6 +1159,280 @@ def cs_scan_v12_backward_flex_cuda(
     return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat.reshape_as(D_phys)
 
 
+def cs_scan_v12_forward_integrator_cuda(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    integrator: str = "heun",
+    imex_iters: int = 3,
+    block_d: int = 128,
+) -> torch.Tensor:
+    _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
+    if stencil not in {4, 8}:
+        raise ValueError(f"Unsupported stencil={stencil}; expected 4 or 8.")
+    _activation_id(activation)
+    _integrator_id(integrator)
+
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    if n_tokens != H * W:
+        raise ValueError(f"H*W={H * W} does not match N={n_tokens}.")
+    if A.numel() != d_dim:
+        raise ValueError(f"A has {A.numel()} values, expected {d_dim}.")
+    if D_phys_flat.numel() != d_dim:
+        raise ValueError(f"D_phys has {D_phys_flat.numel()} values, expected {d_dim}.")
+
+    h = h0
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+    act_id = _activation_id(activation)
+
+    for _ in range(K):
+        if integrator == "heun":
+            pred = torch.empty_like(h)
+            out = torch.empty_like(h)
+            _v12_stage_kernel[grid](
+                h,
+                h,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                pred,
+                DT_SCALE=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            _v12_heun_finish_kernel[grid](
+                h,
+                pred,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                out,
+                DT=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                ACT=act_id,
+                num_warps=4,
+            )
+            h = out
+        elif integrator == "rk4":
+            h2 = torch.empty_like(h)
+            h3 = torch.empty_like(h)
+            h4 = torch.empty_like(h)
+            out = torch.empty_like(h)
+            _v12_stage_kernel[grid](
+                h,
+                h,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                h2,
+                DT_SCALE=0.5 * dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            _v12_stage_kernel[grid](
+                h,
+                h2,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                h3,
+                DT_SCALE=0.5 * dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            _v12_stage_kernel[grid](
+                h,
+                h3,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                h4,
+                DT_SCALE=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                num_warps=4,
+            )
+            _v12_rk4_finish_kernel[grid](
+                h,
+                h2,
+                h3,
+                h4,
+                h0,
+                delta_s,
+                delta_d,
+                A,
+                D_phys_flat,
+                out,
+                DT=dt,
+                B=bsz,
+                HGRID=int(H),
+                WGRID=int(W),
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                STENCIL=int(stencil),
+                ACT=act_id,
+                num_warps=4,
+            )
+            h = out
+        elif integrator == "imex":
+            rhs = torch.empty_like(h)
+            z = torch.empty_like(h)
+            z_next = torch.empty_like(h)
+            _v12_imex_rhs_kernel[grid](
+                h,
+                h0,
+                delta_s,
+                A,
+                rhs,
+                DT=dt,
+                B=bsz,
+                N=n_tokens,
+                D=d_dim,
+                BLOCK_D=block_d,
+                num_warps=4,
+            )
+            z.copy_(rhs)
+            n_iters = max(1, int(imex_iters))
+            for jacobi_iter in range(n_iters):
+                _v12_imex_jacobi_kernel[grid](
+                    rhs,
+                    z,
+                    delta_d,
+                    D_phys_flat,
+                    z_next,
+                    DT=dt,
+                    B=bsz,
+                    HGRID=int(H),
+                    WGRID=int(W),
+                    N=n_tokens,
+                    D=d_dim,
+                    BLOCK_D=block_d,
+                    STENCIL=int(stencil),
+                    ACT=act_id if jacobi_iter == n_iters - 1 else 0,
+                    num_warps=4,
+                )
+                z, z_next = z_next, z
+            h = z
+        else:
+            raise RuntimeError(f"Unsupported integrator={integrator!r}")
+
+    return h
+
+
+class CSScanV12IntegratorFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation, integrator, imex_iters):
+        h = cs_scan_v12_forward_integrator_cuda(
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            int(K),
+            int(H),
+            int(W),
+            stencil=int(stencil),
+            activation=str(activation),
+            integrator=str(integrator),
+            imex_iters=int(imex_iters),
+        )
+        ctx.save_for_backward(h0, delta_s, delta_d, A, D_phys)
+        ctx.K = int(K)
+        ctx.H = int(H)
+        ctx.W = int(W)
+        ctx.stencil = int(stencil)
+        ctx.activation = str(activation)
+        ctx.integrator = str(integrator)
+        ctx.imex_iters = int(imex_iters)
+        return h
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
+        with torch.enable_grad():
+            h0_r = h0.detach().requires_grad_(True)
+            delta_s_r = delta_s.detach().requires_grad_(True)
+            delta_d_r = delta_d.detach().requires_grad_(True)
+            A_r = A.detach().requires_grad_(True)
+            D_phys_r = D_phys.detach().requires_grad_(True)
+            out = _torch_reference_integrator_scan(
+                h0_r,
+                delta_s_r,
+                delta_d_r,
+                A_r,
+                D_phys_r,
+                ctx.K,
+                ctx.H,
+                ctx.W,
+                stencil=ctx.stencil,
+                activation=ctx.activation,
+                integrator=ctx.integrator,
+                imex_iters=ctx.imex_iters,
+            )
+            grads = torch.autograd.grad(
+                out,
+                (h0_r, delta_s_r, delta_d_r, A_r, D_phys_r),
+                grad_output,
+                allow_unused=False,
+            )
+        return grads[0], grads[1], grads[2], grads[3], grads[4], None, None, None, None, None, None, None
+
+
 class CSScanV12FlexFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation):
@@ -811,3 +1511,33 @@ def cs_scan_v12_cuda(h0, delta_s, delta_d, A, D_phys, K, H, W):
 
 def cs_scan_v12_flex_cuda(h0, delta_s, delta_d, A, D_phys, K, H, W, stencil=4, activation="identity"):
     return CSScanV12FlexFunction.apply(h0, delta_s, delta_d, A, D_phys, K, H, W, int(stencil), str(activation))
+
+
+def cs_scan_v12_integrator_cuda(
+    h0,
+    delta_s,
+    delta_d,
+    A,
+    D_phys,
+    K,
+    H,
+    W,
+    stencil=4,
+    activation="identity",
+    integrator="heun",
+    imex_iters=3,
+):
+    return CSScanV12IntegratorFunction.apply(
+        h0,
+        delta_s,
+        delta_d,
+        A,
+        D_phys,
+        K,
+        H,
+        W,
+        int(stencil),
+        str(activation),
+        str(integrator),
+        int(imex_iters),
+    )
