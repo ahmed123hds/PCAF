@@ -510,7 +510,7 @@ def parse_args():
                    choices=['laplacian', 'laplacian8', 'conv2d', 'conv1d'],
                    help="V1.2 spatial operator ablation")
     p.add_argument('--recurrence_nonlinearity', default='identity',
-                   choices=['identity', 'silu', 'tanh', 'gelu', 'relu6', 'relu'],
+                   choices=['identity', 'silu', 'tanh', 'gelu', 'relu6', 'relu', 'lstm'],
                    help="V1.2 activation applied after each recurrence step")
     p.add_argument('--integrator', default='euler',
                    choices=['euler', 'heun', 'rk4', 'imex'],

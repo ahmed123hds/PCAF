@@ -77,7 +77,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
         d_inner = int(expand * d_model)
         if spatial_op not in {"laplacian", "laplacian8", "conv2d", "conv1d"}:
             raise ValueError(f"Unsupported spatial_op={spatial_op!r}")
-        if recurrence_nonlinearity not in {"identity", "silu", "tanh", "gelu", "relu6", "relu"}:
+        if recurrence_nonlinearity not in {"identity", "silu", "tanh", "gelu", "relu6", "relu", "lstm"}:
             raise ValueError(f"Unsupported recurrence_nonlinearity={recurrence_nonlinearity!r}")
         if integrator not in {"euler", "heun", "rk4", "imex"}:
             raise ValueError(f"Unsupported integrator={integrator!r}")
@@ -181,7 +181,7 @@ class ContinuousSpatialSSM_V12(nn.Module):
             return x
         if self.recurrence_nonlinearity == "silu":
             return F.silu(x)
-        if self.recurrence_nonlinearity == "tanh":
+        if self.recurrence_nonlinearity in {"tanh", "lstm"}:
             return torch.tanh(x)
         if self.recurrence_nonlinearity == "gelu":
             return F.gelu(x)
@@ -386,7 +386,8 @@ class ContinuousSpatialMambaBlock_V12(nn.Module):
         else:
             y_ssm = self.continuous_ssm(u, K_steps=K_steps, use_triton=use_triton)
 
-        y = self.out_proj(y_ssm * F.silu(z))
+        gate = torch.sigmoid(z) if self.continuous_ssm.recurrence_nonlinearity == "lstm" else F.silu(z)
+        y = self.out_proj(y_ssm * gate)
         return residual + y
 
 

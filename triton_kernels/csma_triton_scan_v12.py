@@ -26,6 +26,7 @@ _ACT_TO_ID = {
     "identity": 0,
     "silu": 1,
     "tanh": 2,
+    "lstm": 2,
     "relu6": 3,
     "relu": 4,
     "gelu": 5,
@@ -60,7 +61,7 @@ def _torch_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
         return x
     if activation == "silu":
         return F.silu(x)
-    if activation == "tanh":
+    if activation in {"tanh", "lstm"}:
         return torch.tanh(x)
     if activation == "gelu":
         return F.gelu(x)
@@ -419,6 +420,76 @@ def _v12_rk4_finish_kernel(
     k4 = ds * (a * h4 + h0) + dd * dphys * (h4_sum - degree * h4)
     pre = h + (DT / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
     tl.store(OUT_PTR + base, _v12_apply_activation(pre, ACT), mask=mask)
+
+
+@triton.jit
+def _v12_rk4_finish_preact_kernel(
+    H_PTR,
+    H2_PTR,
+    H3_PTR,
+    H4_PTR,
+    H0_PTR,
+    DS_PTR,
+    DD_PTR,
+    A_PTR,
+    DPHYS_PTR,
+    OUT_PTR,
+    DT: tl.constexpr,
+    B: tl.constexpr,
+    HGRID: tl.constexpr,
+    WGRID: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    STENCIL: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+    n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+    n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+    n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+    n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+
+    base = (b * N + n) * D + d
+    h = tl.load(H_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h2 = tl.load(H2_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h3 = tl.load(H3_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h4 = tl.load(H4_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    h_sum = tl.load(H_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h2_sum = tl.load(H2_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h3_sum = tl.load(H3_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    h4_sum = tl.load(H4_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    degree = 4.0
+    if STENCIL == 8:
+        h_sum += tl.load(H_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h2_sum += tl.load(H2_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H2_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h3_sum += tl.load(H3_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H3_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        h4_sum += tl.load(H4_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) + tl.load(H4_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        degree = 8.0
+
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    k1 = ds * (a * h + h0) + dd * dphys * (h_sum - degree * h)
+    k2 = ds * (a * h2 + h0) + dd * dphys * (h2_sum - degree * h2)
+    k3 = ds * (a * h3 + h0) + dd * dphys * (h3_sum - degree * h3)
+    k4 = ds * (a * h4 + h0) + dd * dphys * (h4_sum - degree * h4)
+    pre = h + (DT / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    tl.store(OUT_PTR + base, pre, mask=mask)
 
 
 @triton.jit
@@ -896,6 +967,92 @@ def _v12_backward_step_flex_kernel(
 
     g_prev = gp * (1.0 + DT * ds * a) + lap_r
     tl.store(G_PREV_PTR + base, g_prev, mask=mask)
+
+    old_gh0 = tl.load(GH0_ACC_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GH0_ACC_PTR + base, old_gh0 + DT * ds * gp, mask=mask)
+
+    old_gds = tl.load(GDS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    old_gdd = tl.load(GDD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(GDS_PTR + base, old_gds + DT * gp * (a * h + h0), mask=mask)
+    tl.store(GDD_PTR + base, old_gdd + DT * gp * dphys * lap_h, mask=mask)
+
+    tl.atomic_add(GA_PTR + d, DT * ds * gp * h, sem="relaxed", mask=mask)
+    tl.atomic_add(GDPHYS_PTR + d, DT * dd * gp * lap_h, sem="relaxed", mask=mask)
+
+
+@triton.jit
+def _v12_stage_adjoint_kernel(
+    G_PTR, H_STATE_PTR, H0_PTR, DS_PTR, DD_PTR, A_PTR, DPHYS_PTR,
+    G_PREV_PTR, GH0_ACC_PTR, GDS_PTR, GDD_PTR, GA_PTR, GDPHYS_PTR,
+    DT: tl.constexpr, B: tl.constexpr, HGRID: tl.constexpr, WGRID: tl.constexpr,
+    N: tl.constexpr, D: tl.constexpr, BLOCK_D: tl.constexpr, STENCIL: tl.constexpr,
+):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    d_block = tl.program_id(2)
+    d = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = d < D
+    row = n // WGRID
+    col = n - row * WGRID
+
+    n_top = tl.where(row > 0, n - WGRID, n)
+    n_bot = tl.where(row < HGRID - 1, n + WGRID, n)
+    n_left = tl.where(col > 0, n - 1, n)
+    n_right = tl.where(col < WGRID - 1, n + 1, n)
+
+    base = (b * N + n) * D + d
+    h = tl.load(H_STATE_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    h0 = tl.load(H0_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    ds = tl.load(DS_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    dd = tl.load(DD_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A_PTR + d, mask=mask, other=0.0).to(tl.float32)
+    dphys = tl.load(DPHYS_PTR + d, mask=mask, other=0.0).to(tl.float32)
+
+    h_sum = (
+        tl.load(H_STATE_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_STATE_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_STATE_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(H_STATE_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+
+    gp = tl.load(G_PTR + base, mask=mask, other=0.0).to(tl.float32)
+
+    r = dd * gp
+    r_sum = (
+        tl.load(DD_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_top) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(DD_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_bot) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(DD_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_left) * D + d, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(DD_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_right) * D + d, mask=mask, other=0.0).to(tl.float32)
+    )
+
+    degree = 4.0
+    if STENCIL == 8:
+        n_tl = tl.where((row > 0) & (col > 0), n - WGRID - 1, tl.where(row > 0, n - WGRID, tl.where(col > 0, n - 1, n)))
+        n_tr = tl.where((row > 0) & (col < WGRID - 1), n - WGRID + 1, tl.where(row > 0, n - WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+        n_bl = tl.where((row < HGRID - 1) & (col > 0), n + WGRID - 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col > 0, n - 1, n)))
+        n_br = tl.where((row < HGRID - 1) & (col < WGRID - 1), n + WGRID + 1, tl.where(row < HGRID - 1, n + WGRID, tl.where(col < WGRID - 1, n + 1, n)))
+
+        h_sum += (
+            tl.load(H_STATE_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_STATE_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_STATE_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(H_STATE_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+
+        r_sum += (
+            tl.load(DD_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_tl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(DD_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_tr) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(DD_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_bl) * D + d, mask=mask, other=0.0).to(tl.float32)
+            + tl.load(DD_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32) * tl.load(G_PTR + (b * N + n_br) * D + d, mask=mask, other=0.0).to(tl.float32)
+        )
+        degree = 8.0
+
+    lap_h = h_sum - degree * h
+    lap_r = dphys * (r_sum - degree * r)
+
+    g_prev = gp * ds * a + lap_r
+    old_g = tl.load(G_PREV_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(G_PREV_PTR + base, old_g + DT * g_prev, mask=mask)
 
     old_gh0 = tl.load(GH0_ACC_PTR + base, mask=mask, other=0.0).to(tl.float32)
     tl.store(GH0_ACC_PTR + base, old_gh0 + DT * ds * gp, mask=mask)
@@ -2019,6 +2176,32 @@ def cs_scan_v12_integrator_cuda(
     integrator="heun",
     imex_iters=3,
 ):
+    if integrator == "rk4":
+        return CSScanV12RK4Function.apply(
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            K,
+            H,
+            W,
+            int(stencil),
+            str(activation),
+        )
+    elif integrator == "heun":
+        return CSScanV12HeunFunction.apply(
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            K,
+            H,
+            W,
+            int(stencil),
+            str(activation),
+        )
     return CSScanV12IntegratorFunction.apply(
         h0,
         delta_s,
@@ -2033,3 +2216,353 @@ def cs_scan_v12_integrator_cuda(
         str(integrator),
         int(imex_iters),
     )
+
+
+class CSScanV12RK4Function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation):
+        h, rk4_states = cs_scan_v12_forward_rk4_cuda(
+            h0, delta_s, delta_d, A, D_phys, int(K), int(H), int(W),
+            stencil=int(stencil), activation=str(activation)
+        )
+        ctx.save_for_backward(rk4_states, h0, delta_s, delta_d, A, D_phys)
+        ctx.K = int(K)
+        ctx.H = int(H)
+        ctx.W = int(W)
+        ctx.stencil = int(stencil)
+        ctx.activation = str(activation)
+        return h
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rk4_states, h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
+        grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys = cs_scan_v12_backward_rk4_cuda(
+            grad_output,
+            rk4_states,
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            ctx.K,
+            ctx.H,
+            ctx.W,
+            stencil=ctx.stencil,
+            activation=ctx.activation,
+        )
+        return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys, None, None, None, None, None
+
+
+def cs_scan_v12_forward_rk4_cuda(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    h = h0
+    
+    rk4_states = torch.empty((K, 5, bsz, n_tokens, d_dim), device=h.device, dtype=h.dtype)
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+
+    for step in range(K):
+        rk4_states[step, 0].copy_(h)
+        h2 = rk4_states[step, 1]
+        h3 = rk4_states[step, 2]
+        h4 = rk4_states[step, 3]
+        
+        _v12_stage_kernel[grid](
+            h, h, h0, delta_s, delta_d, A, D_phys_flat, h2,
+            DT_SCALE=0.5 * dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil)
+        )
+        
+        _v12_stage_kernel[grid](
+            h, h2, h0, delta_s, delta_d, A, D_phys_flat, h3,
+            DT_SCALE=0.5 * dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil)
+        )
+        
+        _v12_stage_kernel[grid](
+            h, h3, h0, delta_s, delta_d, A, D_phys_flat, h4,
+            DT_SCALE=dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil)
+        )
+        
+        preact = rk4_states[step, 4]
+        _v12_rk4_finish_preact_kernel[grid](
+            h, h2, h3, h4, h0, delta_s, delta_d, A, D_phys_flat, preact,
+            DT=dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil)
+        )
+        
+        h = _torch_activation(preact, activation)
+        
+    return h, rk4_states
+
+
+def cs_scan_v12_backward_rk4_cuda(
+    grad_output: torch.Tensor,
+    rk4_states: torch.Tensor,
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(grad_output, rk4_states, h0, delta_s, delta_d, A, D_phys)
+    grad_output = grad_output.contiguous()
+    rk4_states = rk4_states.contiguous()
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    g = grad_output
+
+    grad_h0 = torch.zeros_like(h0)
+    grad_delta_s = torch.zeros_like(delta_s)
+    grad_delta_d = torch.zeros_like(delta_d)
+    grad_A = torch.zeros_like(A)
+    grad_D_phys_flat = torch.zeros_like(D_phys_flat)
+
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+    act_id = _activation_id(activation)
+
+    for step in range(K - 1, -1, -1):
+        pre = rk4_states[step, 4]
+        g_pre = torch.empty_like(g)
+        _v12_imex_act_bwd_kernel[grid](
+            g, pre, g_pre,
+            B=bsz, N=n_tokens, D=d_dim, BLOCK_D=block_d, ACT=act_id, num_warps=4
+        )
+
+        h = rk4_states[step, 0]
+        h2 = rk4_states[step, 1]
+        h3 = rk4_states[step, 2]
+        h4 = rk4_states[step, 3]
+
+        g_stage4 = (dt / 6.0) * g_pre
+        g_h4 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_stage4, h4, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h4, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g_stage3 = (dt / 3.0) * g_pre + dt * g_h4
+        g_h3 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_stage3, h3, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h3, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g_stage2 = (dt / 3.0) * g_pre + 0.5 * dt * g_h3
+        g_h2 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_stage2, h2, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h2, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g_stage1 = (dt / 6.0) * g_pre + 0.5 * dt * g_h2
+        g_h1 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_stage1, h, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h1, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g = g_pre + g_h4 + g_h3 + g_h2 + g_h1
+
+    grad_h0 = grad_h0 + g
+
+    return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat.view_as(D_phys)
+
+
+class CSScanV12HeunFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h0, delta_s, delta_d, A, D_phys, K, H, W, stencil, activation):
+        h, heun_states = cs_scan_v12_forward_heun_cuda(
+            h0, delta_s, delta_d, A, D_phys, int(K), int(H), int(W),
+            stencil=int(stencil), activation=str(activation)
+        )
+        ctx.save_for_backward(heun_states, h0, delta_s, delta_d, A, D_phys)
+        ctx.K = int(K)
+        ctx.H = int(H)
+        ctx.W = int(W)
+        ctx.stencil = int(stencil)
+        ctx.activation = str(activation)
+        return h
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        heun_states, h0, delta_s, delta_d, A, D_phys = ctx.saved_tensors
+        grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys = cs_scan_v12_backward_heun_cuda(
+            grad_output,
+            heun_states,
+            h0,
+            delta_s,
+            delta_d,
+            A,
+            D_phys,
+            ctx.K,
+            ctx.H,
+            ctx.W,
+            stencil=ctx.stencil,
+            activation=ctx.activation,
+        )
+        return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys, None, None, None, None, None
+
+
+def cs_scan_v12_forward_heun_cuda(
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(h0, delta_s, delta_d, A, D_phys)
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    h = h0
+    
+    heun_states = torch.empty((K, 3, bsz, n_tokens, d_dim), device=h.device, dtype=h.dtype)
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+
+    for step in range(K):
+        heun_states[step, 0].copy_(h)
+        h_2_pre = heun_states[step, 1]
+        
+        _v12_stage_kernel[grid](
+            h, h, h0, delta_s, delta_d, A, D_phys_flat, h_2_pre,
+            DT_SCALE=dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil)
+        )
+        
+        pred_activated = _torch_activation(h_2_pre, activation)
+        
+        preact = heun_states[step, 2]
+        _v12_heun_finish_kernel[grid](
+            h, pred_activated, h0, delta_s, delta_d, A, D_phys_flat, preact,
+            DT=dt, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil),
+            ACT=0,
+            num_warps=4,
+        )
+        h = _torch_activation(preact, activation)
+        
+    return h, heun_states
+
+
+def cs_scan_v12_backward_heun_cuda(
+    grad_output: torch.Tensor,
+    heun_states: torch.Tensor,
+    h0: torch.Tensor,
+    delta_s: torch.Tensor,
+    delta_d: torch.Tensor,
+    A: torch.Tensor,
+    D_phys: torch.Tensor,
+    K: int,
+    H: int,
+    W: int,
+    *,
+    stencil: int = 4,
+    activation: str = "identity",
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _require_triton_cuda(grad_output, heun_states, h0, delta_s, delta_d, A, D_phys)
+    grad_output = grad_output.contiguous()
+    heun_states = heun_states.contiguous()
+    h0 = h0.contiguous()
+    delta_s = delta_s.contiguous()
+    delta_d = delta_d.contiguous()
+    A = A.contiguous()
+    D_phys_flat = D_phys.contiguous().view(-1)
+
+    bsz, n_tokens, d_dim = h0.shape
+    g = grad_output
+
+    grad_h0 = torch.zeros_like(h0)
+    grad_delta_s = torch.zeros_like(delta_s)
+    grad_delta_d = torch.zeros_like(delta_d)
+    grad_A = torch.zeros_like(A)
+    grad_D_phys_flat = torch.zeros_like(D_phys_flat)
+
+    grid = (bsz, n_tokens, triton.cdiv(d_dim, block_d))
+    dt = 1.0 / float(K)
+    act_id = _activation_id(activation)
+
+    for step in range(K - 1, -1, -1):
+        h = heun_states[step, 0]
+        h_2_pre = heun_states[step, 1]
+        preact = heun_states[step, 2]
+
+        g_pre = torch.empty_like(g)
+        _v12_imex_act_bwd_kernel[grid](
+            g, preact, g_pre,
+            B=bsz, N=n_tokens, D=d_dim, BLOCK_D=block_d, ACT=act_id, num_warps=4
+        )
+
+        g_k2 = 0.5 * dt * g_pre
+        pred_activated = _torch_activation(h_2_pre, activation)
+        g_h2 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_k2, pred_activated, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h2, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g_h2_pre = torch.empty_like(g)
+        _v12_imex_act_bwd_kernel[grid](
+            g_h2, h_2_pre, g_h2_pre,
+            B=bsz, N=n_tokens, D=d_dim, BLOCK_D=block_d, ACT=act_id, num_warps=4
+        )
+
+        g_k1 = 0.5 * dt * g_pre + dt * g_h2_pre
+        g_h1 = torch.zeros_like(g)
+        _v12_stage_adjoint_kernel[grid](
+            g_k1, h, h0, delta_s, delta_d, A, D_phys_flat,
+            g_h1, grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat,
+            DT=1.0, B=bsz, HGRID=int(H), WGRID=int(W), N=n_tokens, D=d_dim, BLOCK_D=block_d, STENCIL=int(stencil), num_warps=4
+        )
+
+        g = g_pre + g_h2_pre + g_h1
+
+    grad_h0 = grad_h0 + g
+
+    return grad_h0, grad_delta_s, grad_delta_d, grad_A, grad_D_phys_flat.view_as(D_phys)
