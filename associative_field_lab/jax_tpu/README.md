@@ -12,8 +12,8 @@ The TPU path differs from the CUDA path:
 - semantic routing is available through `--routing-mode semantic_hash` or
   `--routing-mode hybrid_semantic_hash`
 - `--model` supports `local_conv`, `pcaf_no_gate`, `pcaf_semantic`,
-  `pcaf_hybrid`, `pcaf_context`, `transformer_dense`, `local_transformer`, and
-  `global_local_transformer`
+  `pcaf_hybrid`, `pcaf_context`, `transformer_dense`, `linear_attention`,
+  `local_transformer`, and `global_local_transformer`
 - the model trains a single next-token target after each sampled context window,
   matching the current PyTorch experiment
 
@@ -138,12 +138,22 @@ ROUTING_MODE=hybrid_semantic_hash SEQ_LEN=2048 GLOBAL_BATCH_SIZE=256 \
 ## ICLR Baseline Sweep
 
 This is the main TPU execution script for the paper table. It runs PCAF
-ablations and TPU-native attention baselines on WikiText-103 at 1024 and 2048
-context length by default.
+ablations and TPU-native attention baselines, including a causal linear
+attention baseline, on WikiText-103 at 1024 and 2048 context length by default.
 
 ```bash
 bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
 ```
+
+Full ICLR package:
+
+```bash
+bash associative_field_lab/scripts/run_tpu_iclr_full_package.sh
+```
+
+This runs the 50k-step WikiText-103 comparison, a PG-19 transfer check, the
+PCAF top-k/bucket/context/sequence-length ablation grid, and writes
+`iclr_audit.md`.
 
 From your local machine, launch it on every v4-32 worker:
 
