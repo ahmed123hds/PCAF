@@ -43,11 +43,15 @@ PCAF-context achieves lower perplexity than dense, local-window, and
 global-local attention baselines at both 1024- and 2048-token contexts on a
 single RTX 3060 GPU. At 2048 tokens, PCAF-context obtains 210.7 perplexity at
 469k training tokens/s, compared with 311.7 perplexity and 51k tokens/s for
-local attention—a 9.2$\times$ throughput improvement alongside a 32\% reduction
-in perplexity. Ablation studies confirm that the gain is not explained by the
-local convolutional path alone: removing the associative cache degrades
-perplexity from 210.7 to 261.6, and replacing the learned gate with a fixed
-mixture degrades perplexity to 247.0.
+local attention---a 9.2$\times$ throughput improvement alongside a 32\%
+reduction in perplexity. On the larger WikiText-103 corpus using a distributed
+TPU v4-32 cluster, PCAF-context reaches 95.49 perplexity at 38.92~M~tok/s,
+compared with 311.40 perplexity at 7.16~M~tok/s for the dense Transformer
+baseline---a 5.4$\times$ throughput advantage with 3.3$\times$ lower perplexity.
+Ablation studies confirm that the gain is not explained by the local
+convolutional path alone: removing the associative cache degrades perplexity
+from 210.7 to 261.6, and replacing the learned gate with a fixed mixture
+degrades perplexity to 247.0.
 \end{abstract}
 
 %%
@@ -194,8 +198,8 @@ indices.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.9\linewidth]{pcaf_architecture_diagram}
-  \caption{Overall architecture diagram of the proposed Parallel Causal Associative Field (PCAF). Local context is processed via a causal convolutional backbone (bottom) to compute query hidden states, while previous keys/values are sharded and routed into parallel content-addressed hash buckets. A custom Triton kernel selects a bounded candidate set for fast, subquadratic associative retrieval, which is dynamically combined with the parametric prediction through a learned cache gate (top).}
+  \includegraphics[width=0.85\linewidth]{pcaf_architecture_diagram}
+  \caption{Overall architecture of PCAF. Input tokens are embedded and processed by causal depthwise convolutional blocks (left, teal) to produce hidden states $h_{1:T}$. An MLP head maps $h_T$ to a parametric distribution $p_{\mathrm{param}}$. In parallel, a hash address function routes causal successor records into $B$ hash buckets (right, indigo). A Triton bucket lookup retrieves at most $K$ candidates $\mathcal{C}(T)$, which are scored via key--query attention to form a cache distribution $p_{\mathrm{cache}}$. A learned sigmoid gate $\lambda_T$ mixes the two distributions to produce the final output (top, amber).}
   \label{fig:architecture}
 \end{figure}
 
@@ -234,7 +238,7 @@ hash-colliding repetitions.
 
 For each position $i < T$, PCAF constructs a causal successor record:
 \begin{equation}
-  r_i = (a_i,\; k_i,\; v_i),
+  \mathrm{rec}_i = (a_i,\; k_i,\; v_i),
 \end{equation}
 where $a_i \in \{0,\ldots,B-1\}$ is a discrete bucket address,
 $k_i \in \mathbb{R}^d$ is a continuous key, and $v_i = x_{i+1}$ is the integer
@@ -243,8 +247,9 @@ successor token. The address is computed from a causal $n$-gram hash:
   a_i = H_n(x_{i-n+1:i}) \bmod B,
 \end{equation}
 where $H_n$ is a polynomial rolling hash over $n$ tokens with zero-padding at
-the left boundary. In the best-performing token-hash configuration, $n=1$. The continuous
-keys are $\ell_2$-normalized linear projections of the local hidden states:
+the left boundary. In the best-performing token-hash configuration, $n=1$. The
+continuous keys are $\ell_2$-normalized linear projections of the local hidden
+states:
 \begin{equation}
   k_i = \mathrm{norm}(W_k h_i), \qquad q_T = \mathrm{norm}(W_q h_T).
 \end{equation}
@@ -254,14 +259,15 @@ as ``red car'' and ``scarlet automobile'' receive unrelated addresses even if
 their hidden states are nearby. We therefore also implement a learned semantic
 route. A router maps hidden states to distributions over semantic buckets,
 \begin{equation}
-  r_i = \mathrm{softmax}(W_s h_i / \tau), \qquad
-  r_T = \mathrm{softmax}(W_s h_T / \tau),
+  \tilde{r}_i = \mathrm{softmax}(W_s h_i / \tau), \qquad
+  \tilde{r}_T = \mathrm{softmax}(W_s h_T / \tau),
 \end{equation}
-and scores candidate records by semantic overlap $m_i = r_T^\top r_i$. The
-model supports semantic candidates alone or a hybrid union of exact hash
-candidates and semantic candidates. In the hybrid route, exact matching
-preserves high-precision cache hits while semantic routing allows hidden-state
-similar contexts to retrieve each other even when their surface forms differ.
+and scores candidate records by semantic overlap
+$m_i = \tilde{r}_T^\top \tilde{r}_i$. The model supports semantic candidates
+alone or a hybrid union of exact hash candidates and semantic candidates. In the
+hybrid route, exact matching preserves high-precision cache hits while semantic
+routing allows hidden-state similar contexts to retrieve each other even when
+their surface forms differ.
 
 \noindent\begin{minipage}{\linewidth}
 The forward pass proceeds as follows:
@@ -491,10 +497,17 @@ We trained and compared three classes of architectures on the large-scale \textb
   \label{fig:ablation_curves}
 \end{figure}
 
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\linewidth]{pcaf_throughput_chart}
+  \caption{Training throughput comparison on WikiText-103 (TPU v4-32). PCAF variants achieve 3--5$\times$ higher throughput than Transformer baselines at both sequence lengths, with throughput \emph{increasing} at longer contexts due to improved data parallelism and the absence of quadratic attention.}
+  \label{fig:throughput}
+\end{figure}
+
 The TPU scaling and baseline comparisons suggest three main observations:
 \begin{itemize}
   \item \textbf{Quality at long context:} At sequence length $T=2048$, \textbf{pcaf\_context} reaches a validation perplexity of \textbf{95.49}, compared with \textbf{311.40} for the dense Transformer baseline under this training setup. This supports the hypothesis that a neural cache over structured context addresses can provide useful non-local retrieval without dense all-pairs attention.
-  \item \textbf{Throughput:} At $T=2048$, \textbf{pcaf\_context} reaches \textbf{38.92 M tok/s}, while the dense Transformer baseline reaches \textbf{7.16 M tok/s}. The TPU results use JAX tensor primitives for routing and candidate selection, and therefore measure the XLA implementation rather than the CUDA/Triton path.
+  \item \textbf{Throughput (Figure~\ref{fig:throughput}):} At $T=2048$, \textbf{pcaf\_context} reaches \textbf{38.92~M~tok/s}, while the dense Transformer baseline reaches \textbf{7.16~M~tok/s}---a \textbf{5.4$\times$} advantage. Notably, PCAF throughput \emph{increases} from $T=1024$ to $T=2048$, whereas Transformer throughput decreases due to quadratic attention cost. The TPU results use JAX tensor primitives for routing and candidate selection, and therefore measure the XLA implementation rather than the CUDA/Triton path.
   \item \textbf{Routing ablation:} The discrete context token-hash routing (\textbf{pcaf\_context}) outperforms learned continuous semantic routing (\textbf{pcaf\_semantic}) in this WikiText-103 setup, improving perplexity from 102.84 to 95.49 at $T=2048$. The hybrid route does not improve over the discrete route here, suggesting that exact context recurrence remains highly valuable for word-level language modeling.
 \end{itemize}
 
@@ -505,19 +518,21 @@ The TPU scaling and baseline comparisons suggest three main observations:
 
 The results support three broader observations. First, separating memory
 addressing from value resolution enables a favorable efficiency--accuracy
-trade-off. PCAF-context outperforms all attention baselines in this
-resource-constrained setting, while running at nearly 10$\times$ the training
-throughput of local attention. This suggests that hash-bucket addressing is a
-practical approximation to full nearest-neighbor search when the key
-distribution is sufficiently structured by the $n$-gram context hash.
+trade-off. PCAF-context outperforms all attention baselines in both the
+resource-constrained single-GPU setting (WikiText-2) and the distributed
+TPU-scale setting (WikiText-103), while running at 5--10$\times$ the training
+throughput of attention baselines (Figure~\ref{fig:throughput}). This suggests
+that hash-bucket addressing is a practical approximation to full
+nearest-neighbor search when the key distribution is sufficiently structured by
+the $n$-gram context hash.
 
 Second, the combination of a parametric local path and a non-parametric cache
 is more effective than either component alone. The local convolutional path
 provides smooth syntactic compositionality for common $n$-gram contexts, while
 the cache provides direct long-range token lookup for rarer patterns. The
-learned gate adaptively weights these two sources, a behavior that is consistent
-with prior work showing that cache language models benefit most at the token
-positions where the parametric model is uncertain
+learned gate adaptively weights these two sources, a behavior consistent with
+prior work showing that cache language models benefit most at positions where
+the parametric model is uncertain
 \citep{grave2016continuous,khandelwal2019knn}.
 
 Third, the scaling behavior with context length is encouraging. The perplexity
@@ -571,12 +586,15 @@ pre-built external index. On controlled WikiText-2 long-context experiments,
 PCAF-context substantially outperforms dense attention, sliding-window
 attention, global-local attention, and local-conv ablations at both 1024- and
 2048-token contexts, while achieving an order-of-magnitude higher training
-throughput than attention-based baselines. Ablation studies confirm that both
-the associative cache and the learned mixture gate are necessary contributors
-to these gains. These results suggest that parallel content-addressed memory is
-a promising architectural primitive for efficient long-context sequence
-modeling, and motivate scaling the approach to larger corpora, longer
-contexts, and full autoregressive evaluation.
+throughput than attention-based baselines. On the larger WikiText-103 corpus
+with a distributed TPU v4-32 cluster, PCAF-context reaches 95.49 perplexity at
+38.92~M~tok/s---outperforming the dense Transformer baseline (311.40 perplexity,
+7.16~M~tok/s) by 3.3$\times$ in quality and 5.4$\times$ in throughput.
+Ablation studies confirm that both the associative cache and the learned mixture
+gate are necessary contributors to these gains. These results suggest that
+parallel content-addressed memory is a promising architectural primitive for
+efficient long-context sequence modeling, and motivate scaling the approach to
+larger corpora, longer contexts, and full autoregressive evaluation.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
