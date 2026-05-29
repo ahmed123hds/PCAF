@@ -192,6 +192,13 @@ indices.
 %%
 \section{Method}
 
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.9\linewidth]{iclr_full_architecture_diagram}
+  \caption{Overall architecture diagram of the proposed Parallel Causal Associative Field (PCAF). Local context is processed via a causal convolutional backbone (bottom) to compute query hidden states, while previous keys/values are sharded and routed into parallel content-addressed hash buckets. A custom Triton kernel selects a bounded candidate set for fast, subquadratic associative retrieval, which is dynamically combined with the parametric prediction through a learned cache gate (top).}
+  \label{fig:architecture}
+\end{figure}
+
 \subsection{Problem Setup}
 
 Given a token sequence $x_{1:T}$, the model predicts the next token
