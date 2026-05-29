@@ -256,6 +256,7 @@ candidates and semantic candidates. In the hybrid route, exact matching
 preserves high-precision cache hits while semantic routing allows hidden-state
 similar contexts to retrieve each other even when their surface forms differ.
 
+\noindent\begin{minipage}{\linewidth}
 The forward pass proceeds as follows:
 \begin{enumerate}
   \item $e_{1:T} \leftarrow \texttt{Embedding}(x_{1:T})$
@@ -269,6 +270,7 @@ The forward pass proceeds as follows:
   \item $\lambda_T \leftarrow \sigma(g_\theta(h_T))\cdot\mathbf{1}[\lvert\mathcal{C}(T)\rvert>0]$
   \item \textbf{return} $\log\!\bigl[(1-\lambda_T)\,p_{\mathrm{param}} + \lambda_T\,p_{\mathrm{cache}}\bigr]$
 \end{enumerate}
+\end{minipage}
 
 The query address $a_T$ selects one hash bucket. A custom Triton kernel builds
 fixed-size bucket index arrays in parallel over all sequence positions and
