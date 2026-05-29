@@ -1,0 +1,2 @@
+run	seq_len	batch	params	final_ppl	best_ppl	final_acc	tok_per_sec	train_step_sec	elapsed_min	peak_mem_mb
+pcaf_context_seq1024	1024	64	26592730	392.7518	392.7518	0.1819	513470.1	0.1276	1.15	2409.7
