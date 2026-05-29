@@ -19,7 +19,7 @@ SUMMARY="$ROOT_DIR/associative_field_lab/scripts/summarize_logs.py"
 
 DATASET="${DATASET:-Salesforce/wikitext}"
 DATASET_CONFIG="${DATASET_CONFIG:-wikitext-103-raw-v1}"
-CACHE_DIR="${CACHE_DIR:-$ROOT_DIR/data/hf_cache_jax}"
+CACHE_DIR="${CACHE_DIR:-/tmp/hf_cache}"
 MAX_VOCAB="${MAX_VOCAB:-32000}"
 MAX_TRAIN_TOKENS="${MAX_TRAIN_TOKENS:-50000000}"
 MAX_EVAL_TOKENS="${MAX_EVAL_TOKENS:-2000000}"

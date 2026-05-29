@@ -608,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", default="Salesforce/wikitext")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
-    parser.add_argument("--cache-dir", default="data/hf_cache_jax")
+    parser.add_argument("--cache-dir", default="/tmp/hf_cache")
     parser.add_argument("--max-vocab", type=int, default=20000)
     parser.add_argument("--min-freq", type=int, default=2)
     parser.add_argument("--max-train-tokens", type=int, default=2_000_000)
