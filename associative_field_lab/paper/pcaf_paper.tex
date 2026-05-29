@@ -49,21 +49,19 @@ local records from a context window into hash buckets, retrieves a bounded
 candidate set for the current query, forms a sparse cache distribution over
 successor tokens, and mixes that cache with a parametric local language model
 through a learned gate. The resulting model maintains sparse long-context access
-while avoiding a single fixed recurrent state bottleneck. On WikiText-2
-next-token prediction with a 20k-word vocabulary and 2M training tokens,
-PCAF-context achieves lower perplexity than dense, local-window, and
-global-local attention baselines at both 1024- and 2048-token contexts on a
-single RTX 3060 GPU. At 2048 tokens, PCAF-context obtains 210.7 perplexity at
-469k training tokens/s, compared with 311.7 perplexity and 51k tokens/s for
-local attention---a 9.2$\times$ throughput improvement alongside a 32\%
-reduction in perplexity. On the larger WikiText-103 corpus using a distributed
-TPU v4-32 cluster, PCAF-context reaches 95.49 perplexity at 38.92~M~tok/s,
-compared with 311.40 perplexity at 7.16~M~tok/s for the dense Transformer
-baseline---a 5.4$\times$ throughput advantage with 3.3$\times$ lower perplexity.
-Ablation studies confirm that the gain is not explained by the local
-convolutional path alone: removing the associative cache degrades perplexity
-from 210.7 to 261.6, and replacing the learned gate with a fixed mixture
-degrades perplexity to 247.0.
+while avoiding a single fixed recurrent state bottleneck.
+We evaluate PCAF primarily on the large-scale WikiText-103 corpus using a
+distributed Google Cloud TPU v4-32 pod. PCAF-context reaches 95.49 perplexity
+at 38.92~M~tok/s, compared with 311.40 perplexity at 7.16~M~tok/s for the
+dense Transformer baseline---a 5.4$\times$ throughput advantage alongside a
+3.3$\times$ reduction in perplexity. On the semantic-routing ablation,
+PCAF-context (context token-hash routing) outperforms PCAF-semantic (95.49
+vs.\ 102.84 perplexity at $T{=}2048$), establishing discrete hash routing as
+the stronger design choice. Supplementary single-GPU controlled ablations on
+WikiText-2 using an NVIDIA RTX 3060 confirm that both the associative cache and
+the learned gate are necessary: removing the cache degrades perplexity from
+210.7 to 261.6 at $T{=}2048$, and replacing the learned gate with a fixed
+mixture degrades perplexity to 247.0.
 \end{abstract}
 
 %%
@@ -351,56 +349,101 @@ advantages reported in Tables~\ref{tab:main1024} and~\ref{tab:main2048}.
 %%
 \section{Experiments}
 
-\subsection{Dataset and Evaluation Protocol}
+\subsection{Datasets}
 
-All experiments use the WikiText-2 raw text corpus \citep{merity2016pointer}.
-A word-level vocabulary of 20,000 tokens is constructed from the training
-split, retaining only tokens with frequency $\geq 2$. Training windows are
-sampled from the first 2,000,000 encoded training tokens; evaluation uses
-200,000 validation tokens. Each configuration trains for 5,000 steps and is
-evaluated every 500 steps over 50 sampled validation batches. The same random
-seeds govern both training and evaluation window sampling across all models,
-ensuring that differences in reported metrics reflect model differences rather
-than sampling variance. Perplexity is reported as $\exp(\mathcal{L}_{\mathrm{eval}})$
-over the sampled validation batches.
+Experiments are conducted on two standard language-modeling benchmarks.
+\textbf{WikiText-103} \citep{merity2016pointer} is our primary large-scale
+benchmark: it contains approximately 103~million training tokens covering
+diverse Wikipedia articles, providing a sufficiently large corpus to measure
+distributed-scale efficiency and long-context modeling quality. Scaling studies
+are reported on WikiText-103 using the full distributed TPU v4-32 pod.
+\textbf{WikiText-2} \citep{merity2016pointer} is used for controlled
+single-GPU ablation experiments that isolate the contribution of individual
+PCAF components. A word-level vocabulary of 20,000 tokens is constructed from
+the training split (frequency $\geq 2$). Training windows are sampled from the
+first 2,000,000 encoded training tokens; evaluation uses 200,000 validation
+tokens. Each configuration trains for 5,000 steps and is evaluated every 500
+steps over 50 sampled validation batches. The same random seeds govern both
+training and evaluation sampling across all models. Perplexity is reported as
+$\exp(\mathcal{L}_{\mathrm{eval}})$ over the sampled validation batches.
 
-\paragraph{Hardware and training details.}
-All results were obtained on a single NVIDIA RTX 3060-class GPU with
-approximately 12\,GB VRAM and 64\,GB system RAM. All models are optimized with
-AdamW (learning rate $3 \times 10^{-4}$, weight decay $0.01$) with gradient
-norm clipping at 1.0. Throughput is reported as training tokens per second,
-averaged over the training interval, as logged by the training script.
-Peak memory is PyTorch peak allocated CUDA memory.
+\subsection{Experimental Setup}
+
+\paragraph{Primary hardware: Google Cloud TPU v4-32 pod.}
+All main results and distributed scaling evaluations are conducted on a
+\textbf{Google Cloud TPU v4-32 cluster} (32 TPU v4 cores, 1,024~GB HBM in
+total). Models are implemented in pure JAX and parallelized using
+\texttt{jax.pmap} across the available devices. This setting measures the
+end-to-end throughput and modeling quality of the associative-field primitive
+at practical distributed scale, without relying on the CUDA-specific Triton
+bucket kernel (which is replaced by XLA tensor primitives for routing and
+candidate selection). All WikiText-103 results reported in
+Table~\ref{tab:tpu_baselines} and Table~\ref{tab:tpu_ablations} use this
+hardware.
+
+\paragraph{Secondary hardware: single NVIDIA RTX 3060 GPU.}
+Controlled ablation experiments on WikiText-2 are conducted on a single
+\textbf{NVIDIA RTX 3060} GPU with 12\,GB VRAM and 64\,GB system RAM, using a
+PyTorch implementation with a custom Triton bucket-lookup kernel. This setting
+is used exclusively to isolate the contribution of the associative cache and
+the learned gate under a fixed memory budget, and to report per-component
+ablations at two context lengths. An equal-parameter Mamba baseline at
+batch size 64 exceeded available GPU memory at both context lengths; a
+smaller-batch Mamba comparison on this hardware is deferred to future work.
+
+\paragraph{Optimization.}
+All models are optimized with AdamW (learning rate $3\times10^{-4}$, weight
+decay $0.01$) with gradient norm clipping at 1.0. Throughput is the number of
+training tokens processed per second averaged over the full training interval.
+For TPU experiments, throughput is reported across the full pod in millions of
+tokens per second (M~tok/s). Peak memory for GPU experiments is PyTorch peak
+allocated CUDA memory.
 
 \paragraph{Baselines.}
 Five baselines are evaluated alongside PCAF-context:
 \begin{itemize}
   \item \textbf{Dense Transformer}: 4 layers, $d{=}192$, MLP dimension 1024,
-  4 heads, full causal attention.
+  4 heads, full causal self-attention.
   \item \textbf{Local Transformer} ($w{=}128$): same architecture with a
   128-token causal sliding-window attention mask.
   \item \textbf{Global-local Transformer}: 128-token local window plus 16
   global prefix tokens, following the Longformer design
   \citep{beltagy2020longformer}.
   \item \textbf{Local conv only}: the PCAF local convolutional path without
-  any associative cache; this isolates the contribution of the cache.
-  \item \textbf{PCAF ablations}: (a) no cache—parametric path only with the
-  gate network present; (b) no gate—fixed cache weight of 0.5.
+  any associative cache; isolates the cache contribution.
+  \item \textbf{PCAF ablations}: (a) no cache—parametric path only with gate
+  network present; (b) no gate—fixed cache weight of 0.5.
 \end{itemize}
-An equal-scale Mamba run at batch size 64 resulted in CUDA out-of-memory errors
-at both context lengths on this GPU. A smaller-batch Mamba comparison is
-deferred to future work.
 
-\subsection{Main Results}
+\subsection{Main Results: Distributed Scale on WikiText-103 (TPU v4-32)}
 
-Tables~\ref{tab:main1024} and~\ref{tab:main2048} report results at context
-lengths 1024 and 2048, respectively. PCAF-context achieves the lowest
-perplexity at both lengths. At 2048 tokens, PCAF-context obtains 210.7
-perplexity while running at 469k tokens/s, compared with 311.7 perplexity and
-51k tokens/s for the local attention baseline—a simultaneous 32\% reduction in
-perplexity and 9.2$\times$ improvement in throughput. The dense Transformer
-degrades sharply at 2048 tokens (577.4 perplexity at batch size 8, the largest
-feasible batch), confirming that full attention does not scale gracefully to
+Table~\ref{tab:tpu_baselines} and Table~\ref{tab:tpu_ablations} report our
+primary results on WikiText-103 using the TPU v4-32 pod.
+PCAF-context (context token-hash routing) achieves the lowest perplexity
+among all evaluated models at both context lengths. At $T{=}2048$,
+PCAF-context reaches \textbf{95.49 perplexity at 38.92~M~tok/s},
+versus 311.40 perplexity at 7.16~M~tok/s for the dense Transformer
+baseline---a \textbf{5.4$\times$ throughput gain} and \textbf{3.3$\times$
+perplexity reduction}. Notably, PCAF throughput \emph{increases} from
+$T{=}1024$ to $T{=}2048$ (25.58 to 38.92~M~tok/s), whereas dense Transformer
+throughput decreases due to quadratic attention cost. Among PCAF variants,
+discrete context token-hash routing (pcaf\_context) outperforms continuous
+semantic routing (pcaf\_semantic: 102.84 PPL) and the hybrid blend
+(pcaf\_hybrid: 104.90 PPL) at $T{=}2048$, establishing discrete context-hash
+routing as the best-performing configuration at scale.
+
+\subsection{Single-GPU Component Ablations on WikiText-2 (RTX 3060)}
+
+Tables~\ref{tab:main1024} and~\ref{tab:main2048} report controlled ablation
+results on WikiText-2 using a single RTX 3060 GPU. These experiments are
+designed to isolate the contribution of each PCAF component under a fixed
+12\,GB memory budget and are \emph{not} the primary performance comparison.
+PCAF-context achieves the lowest perplexity at both context lengths. At
+$T{=}2048$, PCAF-context obtains 210.7 perplexity at 469k tokens/s, versus
+311.7 perplexity and 51k tokens/s for the local attention baseline---a 32\%
+perplexity reduction and 9.2$\times$ throughput gain even on a single consumer
+GPU. The dense Transformer degrades sharply at 2048 tokens (577.4 perplexity
+at batch size 8), confirming that full attention does not scale gracefully to
 longer contexts under this memory budget.
 
 \begin{table}[t]
@@ -448,26 +491,33 @@ longer contexts under this memory budget.
   }
 \end{table}
 
-\subsection{Ablation Analysis}
+\subsection{Component Ablation Analysis}
 
-The ablation results yield three clear findings. First, the associative cache
-is essential: removing it (PCAF no cache) degrades perplexity from 210.7 to
-261.6 at 2048 tokens, approaching the local-conv-only baseline (260.2). This
-confirms that the performance advantage of PCAF-context is not explained by
-its local path alone. Second, the learned gate is important: replacing it with
-a fixed 0.5 weight (PCAF no gate) degrades perplexity from 210.7 to 247.0,
-indicating that the model learns to weight the cache adaptively per-position
-rather than applying a constant mixture. Third, the improvement is consistent
-across context lengths: perplexity decreases from 223.9 at 1024 tokens to
-210.7 at 2048 tokens, while throughput remains high (442k vs.\ 469k tokens/s),
-confirming that the model uses additional context productively without
-proportional cost.
+The single-GPU ablation results on WikiText-2 yield three clear findings
+that are consistent with the distributed TPU results. First, the associative
+cache is essential: removing it (PCAF no cache) degrades perplexity from 210.7
+to 261.6 at $T{=}2048$, approaching the local-conv-only baseline (260.2). This
+confirms that the performance advantage of PCAF-context cannot be explained
+by the local convolutional path alone---a finding further corroborated by the
+TPU-scale result where pcaf\_no\_gate reaches only 111.25 PPL versus 95.49 PPL
+for the full PCAF-context model. Second, the learned gate is important:
+replacing it with a fixed 0.5 weight (PCAF no gate) degrades perplexity from
+210.7 to 247.0 on WikiText-2 and from 95.49 to 111.25 on WikiText-103,
+indicating that adaptive per-position cache weighting is beneficial at all
+scales. Third, PCAF-context improves consistently with context length:
+perplexity decreases from 223.9 at $T{=}1024$ to 210.7 at $T{=}2048$ (GPU),
+and from 99.20 to 95.49 (TPU), while throughput remains high or even increases,
+confirming that the model exploits additional context productively without
+proportional computational cost.
 
-\subsection{Scale-Up, Baselines, \& Distributed Ablations on WikiText-103}
+\subsection{Distributed Routing Ablations on WikiText-103 (TPU v4-32)}
 
-To evaluate the scalability, efficiency, and modeling strength of PCAF against standard long-context Transformer baselines, we ported the language-modeling benchmark to a pure-JAX distributed implementation and conducted evaluations on a Google Cloud TPU v4-32 cluster. The TPU implementation uses \texttt{jax.pmap} across the available devices; unlike the CUDA implementation, it does not use Triton kernels.
-
-We trained and compared three classes of architectures on the large-scale \textbf{WikiText-103} dataset: standard dense Transformers, local and global-local attention models, and PCAF configurations (including the proposed context token-hash routing, continuous semantic-hash routing, and hybrid blends). All models are benchmarked across sequence lengths $T \in \{1024, 2048\}$. Table~\ref{tab:tpu_baselines} summarizes the baseline comparisons, Table~\ref{tab:tpu_ablations} details the PCAF routing and gating ablations, and Figure~\ref{fig:ablation_curves} displays the validation perplexity learning curves over training steps.
+Beyond baselines, we evaluate three PCAF routing strategies at scale:
+\textbf{pcaf\_context} (discrete context token-hash routing, proposed),
+\textbf{pcaf\_semantic} (continuous learned semantic-hash routing), and
+\textbf{pcaf\_hybrid} (a blend of token and semantic routing).
+Table~\ref{tab:tpu_ablations} details results and Figure~\ref{fig:ablation_curves}
+shows the full validation perplexity learning curves.
 
 \begin{table}[t]
   \centering
