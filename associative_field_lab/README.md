@@ -505,6 +505,34 @@ SEQ_LENS="1024" \
 bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
 ```
 
+For the full ICLR evidence package, run the longer wrapper. It adds a 50k-step
+WikiText-103 comparison, a PG-19 transfer check, a PCAF top-k/bucket/context
+ablation grid, and a machine-readable audit report:
+
+```bash
+gcloud compute tpus tpu-vm ssh TPU_NAME \
+  --zone ZONE \
+  --project PROJECT \
+  --worker=all \
+  --command='cd ~/models/PCAF && git pull && bash associative_field_lab/scripts/run_tpu_iclr_full_package.sh'
+```
+
+The full package writes:
+
+```text
+associative_field_lab/logs/tpu_iclr_full_<timestamp>/
+  wikitext103_50k/
+  pg19_20k/
+  wikitext103_ablation_grid/
+  iclr_audit.md
+```
+
+Controlled synthetic retrieval experiments are available separately:
+
+```bash
+bash associative_field_lab/scripts/run_mechanism_retrieval.sh
+```
+
 Mamba competitor, using the installed `mamba_ssm` package:
 
 ```bash

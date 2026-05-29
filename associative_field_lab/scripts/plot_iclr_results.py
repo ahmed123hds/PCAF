@@ -25,6 +25,7 @@ plt.rcParams.update({
 # Curated publication color palette
 COLORS = {
     'transformer_dense':                '#434343',  # Dark Charcoal
+    'linear_attention':                 '#5f5f5f',  # Kernel Attention Gray
     'local_transformer_w128':           '#7f7f7f',  # Medium Gray
     'global_local_transformer_w128_g16':'#adadad',  # Light Gray
     'local_conv':                       '#cc3333',  # Strong Red
@@ -36,6 +37,7 @@ COLORS = {
 
 LABELS = {
     'transformer_dense':                'Dense Transformer',
+    'linear_attention':                 'Linear Attention',
     'local_transformer_w128':           'Local Transformer (w=128)',
     'global_local_transformer_w128_g16':'Global-Local Trans. (w=128, g=16)',
     'local_conv':                       'Local Conv (No Cache)',
@@ -47,6 +49,7 @@ LABELS = {
 
 LINESTYLES = {
     'transformer_dense':                (0, (5, 2)),
+    'linear_attention':                 (0, (4, 1, 1, 1)),
     'local_transformer_w128':           (0, (3, 2)),
     'global_local_transformer_w128_g16':(0, (1, 2)),
     'local_conv':                       '-',
@@ -58,6 +61,7 @@ LINESTYLES = {
 
 LINEWIDTHS = {
     'transformer_dense':                1.5,
+    'linear_attention':                 1.5,
     'local_transformer_w128':           1.5,
     'global_local_transformer_w128_g16':1.5,
     'local_conv':                       1.8,
@@ -69,6 +73,7 @@ LINEWIDTHS = {
 
 MARKERS = {
     'transformer_dense':                '^',
+    'linear_attention':                 'P',
     'local_transformer_w128':           'v',
     'global_local_transformer_w128_g16':'>',
     'local_conv':                       'x',
@@ -81,6 +86,7 @@ MARKERS = {
 # Smoothing windows: higher for noisy small-batch attention models
 SMOOTH_WINDOW = {
     'transformer_dense':                5,
+    'linear_attention':                 5,
     'local_transformer_w128':           5,
     'global_local_transformer_w128_g16':5,
     'local_conv':                       3,
@@ -94,6 +100,7 @@ SMOOTH_WINDOW = {
 # Per-model, per-seqlen: (seq_len -> min_step_to_plot)
 BURN_IN = {
     'transformer_dense':                {1024: 1000, 2048: 2000},
+    'linear_attention':                 {1024: 1000, 2048: 2000},
     'local_transformer_w128':           {1024: 1000, 2048: 2000},
     'global_local_transformer_w128_g16':{1024: 1000, 2048: 2000},
     'local_conv':                       {1024: 1000, 2048: 1000},
@@ -147,6 +154,7 @@ def main():
 
     models = [
         'transformer_dense',
+        'linear_attention',
         'local_transformer_w128',
         'global_local_transformer_w128_g16',
         'local_conv',

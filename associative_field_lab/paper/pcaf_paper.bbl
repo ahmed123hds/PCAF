@@ -28,14 +28,14 @@ Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza
   Albin Cassirer, Andy Brock, Michela Paganini, Geoffrey Irving, Oriol Vinyals,
   Simon Osindero, Karen Simonyan, Jack~W. Rae, Erich Elsen, and Laurent Sifre.
 \newblock Improving language models by retrieving from trillions of tokens.
-\newblock In \emph{International Conference on Machine Learning}, pages
+\newblock In \emph{International Conference on Machine Learning}, pp.\
   2206--2240, 2022.
 
 \bibitem[Child et~al.(2019)Child, Gray, Radford, and
   Sutskever]{child2019sparsetransformer}
 Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
 \newblock Generating long sequences with sparse transformers.
-\newblock In \emph{arXiv preprint arXiv:1904.10509}, 2019.
+\newblock \emph{arXiv preprint arXiv:1904.10509}, 2019.
 
 \bibitem[Dai et~al.(2019)Dai, Yang, Yang, Carbonell, Le, and
   Salakhutdinov]{dai2019transformerxl}
@@ -44,9 +44,9 @@ Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc~V. Le, and Ruslan
 \newblock Transformer-xl: Attentive language models beyond a fixed-length
   context.
 \newblock In \emph{Proceedings of the 57th Annual Meeting of the Association
-  for Computational Linguistics}, pages 2978--2988, 2019.
+  for Computational Linguistics}, pp.\  2978--2988, 2019.
 
-\bibitem[Dao and Gu(2024)]{dao2024mamba2}
+\bibitem[Dao \& Gu(2024)Dao and Gu]{dao2024mamba2}
 Tri Dao and Albert Gu.
 \newblock Transformers are {SSM}s: Generalized models and efficient algorithms
   through structured state space duality.
@@ -64,7 +64,7 @@ Alex Graves, Greg Wayne, and Ivo Danihelka.
 \newblock Neural turing machines.
 \newblock \emph{arXiv preprint arXiv:1410.5401}, 2014.
 
-\bibitem[Gu and Dao(2023)]{gu2023mamba}
+\bibitem[Gu \& Dao(2023)Gu and Dao]{gu2023mamba}
 Albert Gu and Tri Dao.
 \newblock Mamba: Linear-time sequence modeling with selective state spaces.
 \newblock \emph{arXiv preprint arXiv:2312.00752}, 2023.
@@ -88,7 +88,7 @@ Gautier Izacard, Patrick Lewis, Maria Lomeli, Lucas Hosseini, Fabio Petroni,
 Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Fran\c{c}ois Fleuret.
 \newblock Transformers are {RNN}s: Fast autoregressive transformers with linear
   attention.
-\newblock In \emph{International Conference on Machine Learning}, pages
+\newblock In \emph{International Conference on Machine Learning}, pp.\
   5156--5165, 2020.
 
 \bibitem[Khandelwal et~al.(2020)Khandelwal, Levy, Jurafsky, Zettlemoyer, and
