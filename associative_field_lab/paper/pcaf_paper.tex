@@ -436,7 +436,7 @@ proportional cost.
 
 \subsection{Scale-Up, Baselines, \& Distributed Ablations on WikiText-103}
 
-To evaluate the scalability, efficiency, and absolute modeling strength of PCAF against standard long-context Transformer baselines, we ported our implementation to a highly optimized pure-JAX distributed codebase and conducted extensive evaluations on a Google Cloud TPU v4-32 Pod cluster (comprising 4 sharded TPU v4 nodes with 32 Tensor Cores). The JAX distributed implementation leverages SPMD sharding via \texttt{jax.experimental.shard\_map} to achieve seamless multi-worker training.
+To evaluate the scalability, efficiency, and modeling strength of PCAF against standard long-context Transformer baselines, we ported the language-modeling benchmark to a pure-JAX distributed implementation and conducted evaluations on a Google Cloud TPU v4-32 cluster. The TPU implementation uses \texttt{jax.pmap} across the available devices; unlike the CUDA implementation, it does not use Triton kernels.
 
 We trained and compared three classes of architectures on the large-scale \textbf{WikiText-103} dataset: standard dense Transformers, local and global-local attention models, and PCAF configurations (including the proposed context token-hash routing, continuous semantic-hash routing, and hybrid blends). All models are benchmarked across sequence lengths $T \in \{1024, 2048\}$. Table~\ref{tab:tpu_ablation} summarizes the perplexity, accuracy, and scaling throughput of this sweep, and Figure~\ref{fig:ablation_curves} displays the validation perplexity learning curves over training steps.
 
@@ -478,15 +478,15 @@ We trained and compared three classes of architectures on the large-scale \textb
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{iclr_baselines_curves}
-  \caption{Validation perplexity curves over training steps on WikiText-103 at sequence lengths $T = 1024$ (left) and $T = 2048$ (right) on a TPU v4-32 cluster. The proposed \textbf{pcaf\_context} routing consistently achieves the lowest perplexity, demonstrating the power of structured associative context retrieval and learned adaptive gating over standard linear and dense attention baselines.}
+  \caption{Validation perplexity curves over training steps on WikiText-103 at sequence lengths $T = 1024$ (left) and $T = 2048$ (right) on a TPU v4-32 cluster. The proposed \textbf{pcaf\_context} routing achieves the lowest perplexity among the evaluated constant-depth associative variants and Transformer baselines.}
   \label{fig:ablation_curves}
 \end{figure}
 
-The TPU scaling and baseline comparisons reveal three critical architectural and physical insights:
+The TPU scaling and baseline comparisons suggest three main observations:
 \begin{itemize}
-  \item \textbf{Significant Perplexity Landslide:} The proposed \textbf{pcaf\_context} model achieves a massive modeling breakthrough compared to dense and local Transformers. At sequence length $T=2048$, \textbf{pcaf\_context} achieves a validation perplexity of \textbf{95.49}, outperforming the dense self-attention baseline (\textbf{311.40} PPL) by a factor of 3.26$\times$. This demonstrates that the non-parametric context associative cache serves as a far more effective long-range retrieval engine than standard quadratic dot-product attention in this regime.
-  \item \textbf{Outstanding Computational Efficiency:} Thanks to the SPMD-sharded parallel Triton bucket lookup, integrating the associative context memory in \textbf{pcaf\_context} incurs negligible computational cost. At $T=2048$, \textbf{pcaf\_context} registers a throughput of \textbf{38.92 M tok/s}, which is **5.44$\times$ faster** than full self-attention (\textbf{7.16 M tok/s}). This highlights the subquadratic complexity advantages of our architectural choice.
-  \item \textbf{Robustness of Discrete Token Hash Routing:} The discrete context token-hash routing (\textbf{pcaf\_context}) consistently outperforms learned continuous semantic routing (\textbf{pcaf\_semantic}), improving perplexity from 102.84 to 95.49 at $T=2048$. Furthermore, combining routing methods (\textbf{pcaf\_hybrid}) does not yield further benefits, indicating that raw discrete n-gram context indices provide a cleaner and more stable associative key space than continuous vector spaces.
+  \item \textbf{Quality at long context:} At sequence length $T=2048$, \textbf{pcaf\_context} reaches a validation perplexity of \textbf{95.49}, compared with \textbf{311.40} for the dense Transformer baseline under this training setup. This supports the hypothesis that a neural cache over structured context addresses can provide useful non-local retrieval without dense all-pairs attention.
+  \item \textbf{Throughput:} At $T=2048$, \textbf{pcaf\_context} reaches \textbf{38.92 M tok/s}, while the dense Transformer baseline reaches \textbf{7.16 M tok/s}. The TPU results use JAX tensor primitives for routing and candidate selection, and therefore measure the XLA implementation rather than the CUDA/Triton path.
+  \item \textbf{Routing ablation:} The discrete context token-hash routing (\textbf{pcaf\_context}) outperforms learned continuous semantic routing (\textbf{pcaf\_semantic}) in this WikiText-103 setup, improving perplexity from 102.84 to 95.49 at $T=2048$. The hybrid route does not improve over the discrete route here, suggesting that exact context recurrence remains highly valuable for word-level language modeling.
 \end{itemize}
 
 %%
