@@ -11,6 +11,8 @@ set -u
 # WikiText-103, 20k steps, 1024/2048 contexts, PCAF ablations, and attention
 # baselines. Override STEPS=5000 DATASET_CONFIG=wikitext-2-raw-v1 for a quick
 # preflight before spending a full TPU run.
+# Limit the matrix with RUN_MODELS, e.g.
+#   RUN_MODELS="pcaf_context local_conv transformer_dense linear_attention"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-python}"
@@ -19,6 +21,7 @@ SUMMARY="$ROOT_DIR/associative_field_lab/scripts/summarize_logs.py"
 
 DATASET="${DATASET:-Salesforce/wikitext}"
 DATASET_CONFIG="${DATASET_CONFIG:-wikitext-103-raw-v1}"
+TEXT_FIELD="${TEXT_FIELD:-text}"  # PG-19 uses 'book_text'; WikiText uses 'text'
 CACHE_DIR="${CACHE_DIR:-/tmp/hf_cache}"
 MAX_VOCAB="${MAX_VOCAB:-32000}"
 MAX_TRAIN_TOKENS="${MAX_TRAIN_TOKENS:-50000000}"
@@ -35,6 +38,9 @@ GLOBAL_BATCH_PCAF="${GLOBAL_BATCH_PCAF:-256}"
 GLOBAL_BATCH_ATTENTION_1024="${GLOBAL_BATCH_ATTENTION_1024:-128}"
 GLOBAL_BATCH_ATTENTION_2048="${GLOBAL_BATCH_ATTENTION_2048:-64}"
 GLOBAL_BATCH_ATTENTION_4096="${GLOBAL_BATCH_ATTENTION_4096:-16}"
+GLOBAL_BATCH_LINEAR_1024="${GLOBAL_BATCH_LINEAR_1024:-128}"
+GLOBAL_BATCH_LINEAR_2048="${GLOBAL_BATCH_LINEAR_2048:-64}"
+GLOBAL_BATCH_LINEAR_4096="${GLOBAL_BATCH_LINEAR_4096:-16}"
 
 PCAF_D_MODEL="${PCAF_D_MODEL:-256}"
 PCAF_D_HIDDEN="${PCAF_D_HIDDEN:-1000}"
@@ -58,6 +64,7 @@ TRAIN_SAMPLE_SEED="${TRAIN_SAMPLE_SEED:-10001}"
 EVAL_SAMPLE_SEED="${EVAL_SAMPLE_SEED:-20001}"
 SEED="${SEED:-1234}"
 JAX_DISTRIBUTED="${JAX_DISTRIBUTED:-1}"
+RUN_MODELS="${RUN_MODELS:-all}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/associative_field_lab/logs/tpu_iclr_${STAMP}}"
@@ -72,6 +79,7 @@ common_args=(
   "${DIST_FLAG[@]}"
   --dataset "$DATASET"
   --dataset-config "$DATASET_CONFIG"
+  --text-field "$TEXT_FIELD"
   --cache-dir "$CACHE_DIR"
   --max-vocab "$MAX_VOCAB"
   --max-train-tokens "$MAX_TRAIN_TOKENS"
@@ -95,6 +103,30 @@ attention_batch_for_seq() {
   else
     echo "$GLOBAL_BATCH_ATTENTION_1024"
   fi
+}
+
+linear_batch_for_seq() {
+  local seq_len="$1"
+  if [[ "$seq_len" -ge 4096 ]]; then
+    echo "$GLOBAL_BATCH_LINEAR_4096"
+  elif [[ "$seq_len" -ge 2048 ]]; then
+    echo "$GLOBAL_BATCH_LINEAR_2048"
+  else
+    echo "$GLOBAL_BATCH_LINEAR_1024"
+  fi
+}
+
+want_model() {
+  local name="$1"
+  if [[ "$RUN_MODELS" == "all" ]]; then
+    return 0
+  fi
+  for candidate in $RUN_MODELS; do
+    if [[ "$candidate" == "$name" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 run_one() {
@@ -131,7 +163,8 @@ run_one() {
 run_pcaf_family() {
   local seq_len="$1"
 
-  run_one "local_conv" "$seq_len" "$GLOBAL_BATCH_PCAF" \
+  if want_model "local_conv"; then
+    run_one "local_conv" "$seq_len" "$GLOBAL_BATCH_PCAF" \
     --model local_conv \
     --d-model "$PCAF_D_MODEL" \
     --d-hidden "$PCAF_D_HIDDEN" \
@@ -140,8 +173,10 @@ run_pcaf_family() {
     --num-buckets "$NUM_BUCKETS" \
     --top-k "$TOP_K" \
     --context-order "$CONTEXT_ORDER"
+  fi
 
-  run_one "pcaf_no_gate" "$seq_len" "$GLOBAL_BATCH_PCAF" \
+  if want_model "pcaf_no_gate"; then
+    run_one "pcaf_no_gate" "$seq_len" "$GLOBAL_BATCH_PCAF" \
     --model pcaf_no_gate \
     --d-model "$PCAF_D_MODEL" \
     --d-hidden "$PCAF_D_HIDDEN" \
@@ -151,8 +186,10 @@ run_pcaf_family() {
     --top-k "$TOP_K" \
     --context-order "$CONTEXT_ORDER" \
     --fixed-cache-weight 0.5
+  fi
 
-  run_one "pcaf_semantic" "$seq_len" "$GLOBAL_BATCH_PCAF" \
+  if want_model "pcaf_semantic"; then
+    run_one "pcaf_semantic" "$seq_len" "$GLOBAL_BATCH_PCAF" \
     --model pcaf_semantic \
     --d-model "$PCAF_D_MODEL" \
     --d-hidden "$PCAF_D_HIDDEN" \
@@ -164,8 +201,10 @@ run_pcaf_family() {
     --semantic-buckets "$SEMANTIC_BUCKETS" \
     --semantic-temperature "$SEMANTIC_TEMPERATURE" \
     --semantic-score-scale "$SEMANTIC_SCORE_SCALE"
+  fi
 
-  run_one "pcaf_hybrid" "$seq_len" "$GLOBAL_BATCH_PCAF" \
+  if want_model "pcaf_hybrid"; then
+    run_one "pcaf_hybrid" "$seq_len" "$GLOBAL_BATCH_PCAF" \
     --model pcaf_hybrid \
     --d-model "$PCAF_D_MODEL" \
     --d-hidden "$PCAF_D_HIDDEN" \
@@ -177,8 +216,10 @@ run_pcaf_family() {
     --semantic-buckets "$SEMANTIC_BUCKETS" \
     --semantic-temperature "$SEMANTIC_TEMPERATURE" \
     --semantic-score-scale "$SEMANTIC_SCORE_SCALE"
+  fi
 
-  run_one "pcaf_context" "$seq_len" "$GLOBAL_BATCH_PCAF" \
+  if want_model "pcaf_context"; then
+    run_one "pcaf_context" "$seq_len" "$GLOBAL_BATCH_PCAF" \
     --model pcaf_context \
     --routing-mode token_hash \
     --d-model "$PCAF_D_MODEL" \
@@ -188,14 +229,18 @@ run_pcaf_family() {
     --num-buckets "$NUM_BUCKETS" \
     --top-k "$TOP_K" \
     --context-order "$CONTEXT_ORDER"
+  fi
 }
 
 run_attention_family() {
   local seq_len="$1"
   local attention_batch
+  local linear_batch
   attention_batch="$(attention_batch_for_seq "$seq_len")"
+  linear_batch="$(linear_batch_for_seq "$seq_len")"
 
-  run_one "transformer_dense" "$seq_len" "$attention_batch" \
+  if want_model "transformer_dense"; then
+    run_one "transformer_dense" "$seq_len" "$attention_batch" \
     --model transformer_dense \
     --d-model "$ATTN_D_MODEL" \
     --d-hidden "$ATTN_D_HIDDEN" \
@@ -203,8 +248,21 @@ run_attention_family() {
     --heads "$ATTN_HEADS" \
     --attention-window "$ATTN_WINDOW" \
     --global-tokens "$GLOBAL_TOKENS"
+  fi
 
-  run_one "local_transformer_w${ATTN_WINDOW}" "$seq_len" "$attention_batch" \
+  if want_model "linear_attention"; then
+    run_one "linear_attention" "$seq_len" "$linear_batch" \
+      --model linear_attention \
+      --d-model "$ATTN_D_MODEL" \
+      --d-hidden "$ATTN_D_HIDDEN" \
+      --layers "$ATTN_LAYERS" \
+      --heads "$ATTN_HEADS" \
+      --attention-window "$ATTN_WINDOW" \
+      --global-tokens "$GLOBAL_TOKENS"
+  fi
+
+  if want_model "local_transformer_w${ATTN_WINDOW}"; then
+    run_one "local_transformer_w${ATTN_WINDOW}" "$seq_len" "$attention_batch" \
     --model local_transformer \
     --d-model "$ATTN_D_MODEL" \
     --d-hidden "$ATTN_D_HIDDEN" \
@@ -212,8 +270,10 @@ run_attention_family() {
     --heads "$ATTN_HEADS" \
     --attention-window "$ATTN_WINDOW" \
     --global-tokens "$GLOBAL_TOKENS"
+  fi
 
-  run_one "global_local_transformer_w${ATTN_WINDOW}_g${GLOBAL_TOKENS}" "$seq_len" "$attention_batch" \
+  if want_model "global_local_transformer_w${ATTN_WINDOW}_g${GLOBAL_TOKENS}"; then
+    run_one "global_local_transformer_w${ATTN_WINDOW}_g${GLOBAL_TOKENS}" "$seq_len" "$attention_batch" \
     --model global_local_transformer \
     --d-model "$ATTN_D_MODEL" \
     --d-hidden "$ATTN_D_HIDDEN" \
@@ -221,6 +281,7 @@ run_attention_family() {
     --heads "$ATTN_HEADS" \
     --attention-window "$ATTN_WINDOW" \
     --global-tokens "$GLOBAL_TOKENS"
+  fi
 }
 
 for seq_len in $SEQ_LENS; do

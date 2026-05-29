@@ -79,8 +79,22 @@ class HostBatcher:
         )
 
 
-def iter_texts(dataset_split) -> list[str]:
-    return [row["text"] for row in dataset_split if row.get("text", "").strip()]
+def iter_texts(dataset_split, text_field: str = "text") -> list[str]:
+    """Extract text strings from a HuggingFace dataset split.
+
+    Supports multiple field names so datasets like PG-19 (field='book_text')
+    work without any code changes — just pass --text-field book_text.
+    """
+    # Allow a comma-separated fallback list, e.g. "book_text,text"
+    fields = [f.strip() for f in text_field.split(",")]
+    results: list[str] = []
+    for row in dataset_split:
+        for field in fields:
+            val = row.get(field, "")
+            if isinstance(val, str) and val.strip():
+                results.append(val)
+                break
+    return results
 
 
 def build_vocab(texts: list[str], *, max_vocab: int, min_freq: int) -> Vocab:
@@ -471,16 +485,26 @@ def transformer_block_forward(
     k = k.reshape(bsz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
     v = v.reshape(bsz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
 
-    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
-    allowed = attention_mask(
-        seq_len,
-        attention_mode=attention_mode,
-        window_size=window_size,
-        global_tokens=global_tokens,
-    )
-    scores = jnp.where(allowed[None, None, :, :], scores, -1.0e9)
-    weights = jax.nn.softmax(scores, axis=-1)
-    attn = jnp.einsum("bhts,bhsd->bhtd", weights, v)
+    if attention_mode == "linear":
+        q_phi = jax.nn.elu(q) + 1.0
+        k_phi = jax.nn.elu(k) + 1.0
+        kv = k_phi[..., :, :, None] * v[..., :, None, :]
+        prefix_kv = jnp.cumsum(kv, axis=2)
+        prefix_k = jnp.cumsum(k_phi, axis=2)
+        numer = jnp.einsum("bhtd,bhtde->bhte", q_phi, prefix_kv)
+        denom = jnp.einsum("bhtd,bhtd->bht", q_phi, prefix_k)
+        attn = numer / jnp.maximum(denom[..., None], 1.0e-6)
+    else:
+        scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
+        allowed = attention_mask(
+            seq_len,
+            attention_mode=attention_mode,
+            window_size=window_size,
+            global_tokens=global_tokens,
+        )
+        scores = jnp.where(allowed[None, None, :, :], scores, -1.0e9)
+        weights = jax.nn.softmax(scores, axis=-1)
+        attn = jnp.einsum("bhts,bhsd->bhtd", weights, v)
     attn = attn.transpose(0, 2, 1, 3).reshape(bsz, seq_len, d_model)
     x = x + (attn @ block["out_w"] + block["out_b"])
 
@@ -601,6 +625,7 @@ def parse_args() -> argparse.Namespace:
             "pcaf_semantic",
             "pcaf_hybrid",
             "transformer_dense",
+            "linear_attention",
             "local_transformer",
             "global_local_transformer",
         ],
@@ -608,6 +633,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", default="Salesforce/wikitext")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
+    parser.add_argument(
+        "--text-field",
+        default="text",
+        help="Dataset column name(s) containing raw text. Comma-separated for "
+             "fallback order. PG-19 uses 'book_text'; WikiText uses 'text'.",
+    )
     parser.add_argument("--cache-dir", default="/tmp/hf_cache")
     parser.add_argument("--max-vocab", type=int, default=20000)
     parser.add_argument("--min-freq", type=int, default=2)
@@ -664,10 +695,11 @@ def main() -> None:
     if per_process_batch % local_device_count != 0:
         raise ValueError("per-process batch must divide local_device_count")
 
-    raw = load_dataset(args.dataset, args.dataset_config, cache_dir=args.cache_dir)
-    train_texts = iter_texts(raw["train"])
+    dataset_config = None if args.dataset_config.lower() in {"", "none", "null"} else args.dataset_config
+    raw = load_dataset(args.dataset, dataset_config, cache_dir=args.cache_dir)
+    train_texts = iter_texts(raw["train"], text_field=args.text_field)
     eval_split = "validation" if "validation" in raw else "test"
-    eval_texts = iter_texts(raw[eval_split])
+    eval_texts = iter_texts(raw[eval_split], text_field=args.text_field)
     vocab = build_vocab(train_texts, max_vocab=args.max_vocab, min_freq=args.min_freq)
     train_ids = encode_corpus(train_texts, vocab, limit=args.max_train_tokens)
     eval_ids = encode_corpus(eval_texts, vocab, limit=args.max_eval_tokens)
@@ -690,6 +722,7 @@ def main() -> None:
     key = random.PRNGKey(args.seed)
     transformer_models = {
         "transformer_dense",
+        "linear_attention",
         "local_transformer",
         "global_local_transformer",
     }
@@ -731,7 +764,9 @@ def main() -> None:
         routing_mode = "hybrid_semantic_hash"
 
     attention_mode = "dense"
-    if args.model == "local_transformer":
+    if args.model == "linear_attention":
+        attention_mode = "linear"
+    elif args.model == "local_transformer":
         attention_mode = "local"
     elif args.model == "global_local_transformer":
         attention_mode = "global_local"
@@ -764,7 +799,7 @@ def main() -> None:
             f"processes={process_count} process_index={process_index}"
         )
         print(
-            f"dataset={args.dataset}/{args.dataset_config} split={eval_split} "
+            f"dataset={args.dataset}/{dataset_config or 'default'} split={eval_split} "
             f"model={args.model} "
             f"vocab={vocab.size} train_tokens={len(train_ids):,} "
             f"eval_tokens={len(eval_ids):,} params={n_params:,}"
@@ -822,12 +857,26 @@ def main() -> None:
                     {
                         "step": step,
                         "model": args.model,
+                        "dataset": args.dataset,
+                        "dataset_config": dataset_config or "",
+                        "eval_split": eval_split,
                         "params": n_params,
                         "seq_len": args.seq_len,
                         "global_batch_size": args.global_batch_size,
                         "batch_size": args.global_batch_size,
                         "per_process_batch": per_process_batch,
                         "per_device_batch": train_batcher.per_device_batch,
+                        "max_vocab": args.max_vocab,
+                        "train_tokens": len(train_ids),
+                        "eval_tokens": len(eval_ids),
+                        "steps_total": args.steps,
+                        "eval_every": args.eval_every,
+                        "eval_batches": args.eval_batches,
+                        "lr": args.lr,
+                        "weight_decay": args.weight_decay,
+                        "seed": args.seed,
+                        "train_sample_seed": args.train_sample_seed,
+                        "eval_sample_seed": args.eval_sample_seed,
                         "train_loss": train_loss,
                         "train_acc": train_acc,
                         "eval_loss": eval_loss,
