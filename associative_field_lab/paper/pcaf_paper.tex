@@ -1,5 +1,5 @@
 \documentclass{article}
-\usepackage{iclr2024_conference,times}
+\usepackage{iclr2027_conference,times}
 
 % Optional math commands from https://github.com/goodfeli/dlbook_notation.
 \input{math_commands.tex}
@@ -210,7 +210,7 @@ indices.
 
 Figure~\ref{fig:architecture} illustrates the overall architecture of the proposed Parallel Causal Associative Field (PCAF) model. The architecture consists of a local parametric path running in parallel with a content-addressed associative memory module. Under this scheme, memory addressing and value resolution are decoupled, allowing fast subquadratic sequence processing with bounded candidate lookups.
 
-\begin{figure}[H]
+\begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{pcaf_architecture_diagram}
   \caption{Overall architecture of PCAF. Input tokens are embedded and processed by causal depthwise convolutional blocks (left, teal) to produce hidden states $h_{1:T}$. An MLP head maps $h_T$ to a parametric distribution $p_{\mathrm{param}}$. In parallel, a hash address function routes causal successor records into $B$ hash buckets (right, indigo). A Triton bucket lookup retrieves at most $K$ candidates $\mathcal{C}(T)$, which are scored via key--query attention to form a cache distribution $p_{\mathrm{cache}}$. A learned sigmoid gate $\lambda_T$ mixes the two distributions to produce the final output (top, amber).}
@@ -403,7 +403,7 @@ degrades sharply at 2048 tokens (577.4 perplexity at batch size 8, the largest
 feasible batch), confirming that full attention does not scale gracefully to
 longer contexts under this memory budget.
 
-\begin{table}[H]
+\begin{table}[t]
   \centering
   \caption{WikiText-2 next-token prediction at context length 1024. Lower
   perplexity is better. Best results in \textbf{bold}.}
@@ -425,7 +425,7 @@ longer contexts under this memory budget.
   }
 \end{table}
 
-\begin{table}[H]
+\begin{table}[t]
   \centering
   \caption{WikiText-2 next-token prediction at context length 2048.
   PCAF-context benefits from the longer context while sparse attention
@@ -469,7 +469,7 @@ To evaluate the scalability, efficiency, and modeling strength of PCAF against s
 
 We trained and compared three classes of architectures on the large-scale \textbf{WikiText-103} dataset: standard dense Transformers, local and global-local attention models, and PCAF configurations (including the proposed context token-hash routing, continuous semantic-hash routing, and hybrid blends). All models are benchmarked across sequence lengths $T \in \{1024, 2048\}$. Table~\ref{tab:tpu_baselines} summarizes the baseline comparisons, Table~\ref{tab:tpu_ablations} details the PCAF routing and gating ablations, and Figure~\ref{fig:ablation_curves} displays the validation perplexity learning curves over training steps.
 
-\begin{table}[H]
+\begin{table}[t]
   \centering
   \caption{Distributed JAX scaling baseline sweeps on a Google Cloud TPU v4-32 cluster on the WikiText-103 dataset. Throughput is reported in million tokens per second ($\text{M tok/s}$) across the full pod. Perplexities represent next-token prediction metrics.}
   \label{tab:tpu_baselines}
@@ -493,7 +493,7 @@ We trained and compared three classes of architectures on the large-scale \textb
   }
 \end{table}
 
-\begin{table}[H]
+\begin{table}[t]
   \centering
   \caption{Distributed JAX PCAF routing and gating ablations on a Google Cloud TPU v4-32 cluster on the WikiText-103 dataset.}
   \label{tab:tpu_ablations}
@@ -517,14 +517,14 @@ We trained and compared three classes of architectures on the large-scale \textb
   }
 \end{table}
 
-\begin{figure}[H]
+\begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{iclr_baselines_curves}
   \caption{Validation perplexity curves over training steps on WikiText-103 at sequence lengths $T = 1024$ (left) and $T = 2048$ (right) on a TPU v4-32 cluster. The proposed \textbf{pcaf\_context} routing achieves the lowest perplexity among the evaluated constant-depth associative variants and Transformer baselines.}
   \label{fig:ablation_curves}
 \end{figure}
 
-\begin{figure}[H]
+\begin{figure}[t]
   \centering
   \includegraphics[width=0.85\linewidth]{pcaf_throughput_chart}
   \caption{Training throughput comparison on WikiText-103 (TPU v4-32). PCAF variants achieve 3--5$\times$ higher throughput than Transformer baselines at both sequence lengths, with throughput \emph{increasing} at longer contexts due to improved data parallelism and the absence of quadratic attention.}
@@ -623,7 +623,7 @@ parallel content-addressed memory is a promising architectural primitive for
 efficient long-context sequence modeling, and motivate scaling the approach to
 larger corpora, longer contexts, and full autoregressive evaluation.
 
-\bibliographystyle{iclr2024_conference}
+\bibliographystyle{iclr2027_conference}
 \bibliography{references}
 
 \end{document}
