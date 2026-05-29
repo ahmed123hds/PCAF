@@ -471,6 +471,40 @@ STEPS=5000 BATCH_ATTENTION=16 BATCH_DENSE_2048=4 \
 Dense Transformer at `seq_len=2048` may still OOM on some RTX 3060 cards. The
 script records the failure and continues to the next model.
 
+## TPU ICLR Runner
+
+For the serious paper table, use the TPU/JAX runner. It defaults to
+WikiText-103, 20k steps, 1024/2048 context lengths, PCAF ablations, semantic
+hashing, dense Transformer, local Transformer, and global+local Transformer.
+
+```bash
+bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
+```
+
+On a TPU v4-32, launch it on every worker:
+
+```bash
+gcloud compute tpus tpu-vm ssh TPU_NAME \
+  --zone ZONE \
+  --project PROJECT \
+  --worker=all \
+  --command='cd ~/PCAF && bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh'
+```
+
+For a cheap preflight before the full run:
+
+```bash
+DATASET_CONFIG=wikitext-2-raw-v1 \
+MAX_VOCAB=20000 \
+MAX_TRAIN_TOKENS=2000000 \
+MAX_EVAL_TOKENS=200000 \
+STEPS=100 \
+EVAL_EVERY=50 \
+EVAL_BATCHES=5 \
+SEQ_LENS="1024" \
+bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
+```
+
 Mamba competitor, using the installed `mamba_ssm` package:
 
 ```bash

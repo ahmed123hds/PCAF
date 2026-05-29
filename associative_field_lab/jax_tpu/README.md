@@ -1,8 +1,8 @@
 # JAX TPU PCAF
 
-This is a pure-JAX/XLA implementation of `pcaf_context` for TPU. It does not
-use PyTorch, Triton, Flax, or Optax. The optimizer is a small manual AdamW
-implementation, and the model is distributed with `jax.pmap`.
+This is a pure-JAX/XLA implementation of `pcaf_context` and TPU-native
+baselines. It does not use PyTorch, Triton, Flax, or Optax. The optimizer is a
+small manual AdamW implementation, and the model is distributed with `jax.pmap`.
 
 The TPU path differs from the CUDA path:
 
@@ -11,6 +11,9 @@ The TPU path differs from the CUDA path:
 - candidate selection is implemented with static JAX tensor ops and `lax.top_k`
 - semantic routing is available through `--routing-mode semantic_hash` or
   `--routing-mode hybrid_semantic_hash`
+- `--model` supports `local_conv`, `pcaf_no_gate`, `pcaf_semantic`,
+  `pcaf_hybrid`, `pcaf_context`, `transformer_dense`, `local_transformer`, and
+  `global_local_transformer`
 - the model trains a single next-token target after each sampled context window,
   matching the current PyTorch experiment
 
@@ -130,6 +133,44 @@ Semantic route through the helper script:
 ```bash
 ROUTING_MODE=hybrid_semantic_hash SEQ_LEN=2048 GLOBAL_BATCH_SIZE=256 \
   bash associative_field_lab/scripts/run_tpu_v4_32_pcaf.sh
+```
+
+## ICLR Baseline Sweep
+
+This is the main TPU execution script for the paper table. It runs PCAF
+ablations and TPU-native attention baselines on WikiText-103 at 1024 and 2048
+context length by default.
+
+```bash
+bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
+```
+
+From your local machine, launch it on every v4-32 worker:
+
+```bash
+TPU_NAME=your-tpu-name
+ZONE=your-zone
+PROJECT=your-project
+
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+  --zone "$ZONE" \
+  --project "$PROJECT" \
+  --worker=all \
+  --command='cd ~/PCAF && bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh'
+```
+
+Quick preflight before the full 20k-step run:
+
+```bash
+DATASET_CONFIG=wikitext-2-raw-v1 \
+MAX_VOCAB=20000 \
+MAX_TRAIN_TOKENS=2000000 \
+MAX_EVAL_TOKENS=200000 \
+STEPS=100 \
+EVAL_EVERY=50 \
+EVAL_BATCHES=5 \
+SEQ_LENS="1024" \
+bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
 ```
 
 For a quick compile/smoke run:

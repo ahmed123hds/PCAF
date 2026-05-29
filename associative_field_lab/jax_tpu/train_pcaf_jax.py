@@ -177,6 +177,70 @@ def init_params(
     return params
 
 
+def sinusoidal_positions(max_len: int, d_model: int) -> jnp.ndarray:
+    pos = jnp.arange(max_len, dtype=jnp.float32)[:, None]
+    half = (d_model + 1) // 2
+    freq = jnp.exp(
+        -math.log(10_000.0) * jnp.arange(half, dtype=jnp.float32) / max(half - 1, 1)
+    )
+    angles = pos * freq[None, :]
+    pe = jnp.zeros((max_len, d_model), dtype=jnp.float32)
+    pe = pe.at[:, 0::2].set(jnp.sin(angles[:, : pe[:, 0::2].shape[1]]))
+    pe = pe.at[:, 1::2].set(jnp.cos(angles[:, : pe[:, 1::2].shape[1]]))
+    return pe
+
+
+def init_transformer_params(
+    key,
+    *,
+    vocab_size: int,
+    d_model: int,
+    d_hidden: int,
+    layers: int,
+    heads: int,
+    max_seq_len: int,
+) -> dict[str, Any]:
+    if d_model % heads != 0:
+        raise ValueError("d_model must divide heads")
+    key, keys = split_key(key, 4 + 4 * layers)
+    params: dict[str, Any] = {}
+    params["emb"] = random.normal(keys.pop(), (vocab_size, d_model), dtype=jnp.float32) * 0.02
+    params["pos"] = sinusoidal_positions(max_seq_len, d_model)
+
+    blocks = []
+    for _ in range(layers):
+        k_qkv = keys.pop()
+        k_out = keys.pop()
+        k_ff1 = keys.pop()
+        k_ff2 = keys.pop()
+        qkv_w, qkv_b = init_linear(k_qkv, d_model, 3 * d_model)
+        out_w, out_b = init_linear(k_out, d_model, d_model)
+        ff1_w, ff1_b = init_linear(k_ff1, d_model, d_hidden)
+        ff2_w, ff2_b = init_linear(k_ff2, d_hidden, d_model)
+        blocks.append(
+            {
+                "ln1_scale": jnp.ones((d_model,), dtype=jnp.float32),
+                "ln1_bias": jnp.zeros((d_model,), dtype=jnp.float32),
+                "qkv_w": qkv_w,
+                "qkv_b": qkv_b,
+                "out_w": out_w,
+                "out_b": out_b,
+                "ln2_scale": jnp.ones((d_model,), dtype=jnp.float32),
+                "ln2_bias": jnp.zeros((d_model,), dtype=jnp.float32),
+                "ff1_w": ff1_w,
+                "ff1_b": ff1_b,
+                "ff2_w": ff2_w,
+                "ff2_b": ff2_b,
+            }
+        )
+    params["blocks"] = blocks
+    params["head_ln_scale"] = jnp.ones((d_model,), dtype=jnp.float32)
+    params["head_ln_bias"] = jnp.zeros((d_model,), dtype=jnp.float32)
+    params["head_w1"], params["head_b1"] = init_linear(keys.pop(), d_model, d_hidden)
+    params["head_w2"], params["head_b2"] = init_linear(keys.pop(), d_hidden, vocab_size)
+    return params
+
+
 def tree_zeros_like(tree):
     return jax.tree_util.tree_map(jnp.zeros_like, tree)
 
@@ -373,8 +437,111 @@ def pcaf_forward(
     return jnp.logaddexp(jnp.log1p(-gate) + param_log_probs, jnp.log(gate) + cache_log_probs)
 
 
+def attention_mask(seq_len: int, *, attention_mode: str, window_size: int, global_tokens: int):
+    q = jnp.arange(seq_len, dtype=jnp.int32)[:, None]
+    k = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    allowed = k <= q
+    if attention_mode == "local":
+        allowed = allowed & ((q - k) < window_size)
+    elif attention_mode == "global_local":
+        local = (q - k) < window_size
+        global_key = k < global_tokens
+        allowed = allowed & (local | global_key)
+    elif attention_mode != "dense":
+        raise ValueError(f"unknown attention_mode={attention_mode}")
+    return allowed
+
+
+def transformer_block_forward(
+    block,
+    x,
+    *,
+    heads: int,
+    attention_mode: str,
+    window_size: int,
+    global_tokens: int,
+):
+    bsz, seq_len, d_model = x.shape
+    head_dim = d_model // heads
+
+    y = layer_norm(x, block["ln1_scale"], block["ln1_bias"])
+    qkv = y @ block["qkv_w"] + block["qkv_b"]
+    q, k, v = jnp.split(qkv, 3, axis=-1)
+    q = q.reshape(bsz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+    k = k.reshape(bsz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+    v = v.reshape(bsz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+
+    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
+    allowed = attention_mask(
+        seq_len,
+        attention_mode=attention_mode,
+        window_size=window_size,
+        global_tokens=global_tokens,
+    )
+    scores = jnp.where(allowed[None, None, :, :], scores, -1.0e9)
+    weights = jax.nn.softmax(scores, axis=-1)
+    attn = jnp.einsum("bhts,bhsd->bhtd", weights, v)
+    attn = attn.transpose(0, 2, 1, 3).reshape(bsz, seq_len, d_model)
+    x = x + (attn @ block["out_w"] + block["out_b"])
+
+    z = layer_norm(x, block["ln2_scale"], block["ln2_bias"])
+    z = jax.nn.gelu(z @ block["ff1_w"] + block["ff1_b"])
+    z = z @ block["ff2_w"] + block["ff2_b"]
+    return x + z
+
+
+def transformer_forward(
+    params,
+    tokens,
+    *,
+    heads: int,
+    attention_mode: str,
+    window_size: int,
+    global_tokens: int,
+):
+    seq_len = tokens.shape[1]
+    x = params["emb"][tokens] + params["pos"][None, :seq_len, :]
+    for block in params["blocks"]:
+        x = transformer_block_forward(
+            block,
+            x,
+            heads=heads,
+            attention_mode=attention_mode,
+            window_size=window_size,
+            global_tokens=global_tokens,
+        )
+    h = layer_norm(x[:, -1, :], params["head_ln_scale"], params["head_ln_bias"])
+    h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
+    return jax.nn.log_softmax(h @ params["head_w2"] + params["head_b2"], axis=-1)
+
+
 def loss_and_metrics(params, tokens, targets, cfg):
-    log_probs = pcaf_forward(params, tokens, **cfg)
+    if cfg["model_family"] == "transformer":
+        log_probs = transformer_forward(
+            params,
+            tokens,
+            heads=cfg["heads"],
+            attention_mode=cfg["attention_mode"],
+            window_size=cfg["attention_window"],
+            global_tokens=cfg["global_tokens"],
+        )
+    else:
+        log_probs = pcaf_forward(
+            params,
+            tokens,
+            vocab_size=cfg["vocab_size"],
+            d_model=cfg["d_model"],
+            num_buckets=cfg["num_buckets"],
+            top_k=cfg["top_k"],
+            context_order=cfg["context_order"],
+            routing_mode=cfg["routing_mode"],
+            semantic_buckets=cfg["semantic_buckets"],
+            semantic_temperature=cfg["semantic_temperature"],
+            semantic_score_scale=cfg["semantic_score_scale"],
+            use_cache=cfg["use_cache"],
+            use_gate=cfg["use_gate"],
+            fixed_cache_weight=cfg["fixed_cache_weight"],
+        )
     target_log_probs = jnp.take_along_axis(log_probs, targets[:, None], axis=1)[:, 0]
     loss = -jnp.mean(target_log_probs)
     pred = jnp.argmax(log_probs, axis=-1)
@@ -423,8 +590,22 @@ def append_jsonl(path: str, row: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pure-JAX TPU PCAF-context LM")
+    parser = argparse.ArgumentParser(description="Pure-JAX TPU PCAF and baseline LM")
     parser.add_argument("--jax-distributed", action="store_true")
+    parser.add_argument(
+        "--model",
+        choices=[
+            "pcaf_context",
+            "local_conv",
+            "pcaf_no_gate",
+            "pcaf_semantic",
+            "pcaf_hybrid",
+            "transformer_dense",
+            "local_transformer",
+            "global_local_transformer",
+        ],
+        default="pcaf_context",
+    )
     parser.add_argument("--dataset", default="Salesforce/wikitext")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     parser.add_argument("--cache-dir", default="data/hf_cache_jax")
@@ -446,6 +627,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-hidden", type=int, default=1000)
     parser.add_argument("--local-layers", type=int, default=2)
     parser.add_argument("--local-kernel-size", type=int, default=5)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--attention-window", type=int, default=128)
+    parser.add_argument("--global-tokens", type=int, default=16)
     parser.add_argument("--num-buckets", type=int, default=32768)
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--context-order", type=int, default=1)
@@ -503,33 +688,72 @@ def main() -> None:
     )
 
     key = random.PRNGKey(args.seed)
-    params = init_params(
-        key,
-        vocab_size=vocab.size,
-        d_model=args.d_model,
-        d_hidden=args.d_hidden,
-        local_layers=args.local_layers,
-        local_kernel_size=args.local_kernel_size,
-        semantic_buckets=args.semantic_buckets,
-    )
+    transformer_models = {
+        "transformer_dense",
+        "local_transformer",
+        "global_local_transformer",
+    }
+    if args.model in transformer_models:
+        params = init_transformer_params(
+            key,
+            vocab_size=vocab.size,
+            d_model=args.d_model,
+            d_hidden=args.d_hidden,
+            layers=args.layers,
+            heads=args.heads,
+            max_seq_len=args.seq_len,
+        )
+    else:
+        params = init_params(
+            key,
+            vocab_size=vocab.size,
+            d_model=args.d_model,
+            d_hidden=args.d_hidden,
+            local_layers=args.local_layers,
+            local_kernel_size=args.local_kernel_size,
+            semantic_buckets=args.semantic_buckets,
+        )
     opt_state = init_adam_state(params)
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     params = replicate(params, local_devices)
     opt_state = replicate(opt_state, local_devices)
 
+    routing_mode = args.routing_mode
+    use_cache = not args.no_cache
+    use_gate = not args.no_gate
+    if args.model == "local_conv":
+        use_cache = False
+    elif args.model == "pcaf_no_gate":
+        use_gate = False
+    elif args.model == "pcaf_semantic":
+        routing_mode = "semantic_hash"
+    elif args.model == "pcaf_hybrid":
+        routing_mode = "hybrid_semantic_hash"
+
+    attention_mode = "dense"
+    if args.model == "local_transformer":
+        attention_mode = "local"
+    elif args.model == "global_local_transformer":
+        attention_mode = "global_local"
+
     cfg = {
+        "model_family": "transformer" if args.model in transformer_models else "pcaf",
         "vocab_size": vocab.size,
         "d_model": args.d_model,
         "num_buckets": args.num_buckets,
         "top_k": args.top_k,
         "context_order": args.context_order,
-        "routing_mode": args.routing_mode,
+        "routing_mode": routing_mode,
         "semantic_buckets": args.semantic_buckets,
         "semantic_temperature": args.semantic_temperature,
         "semantic_score_scale": args.semantic_score_scale,
-        "use_cache": not args.no_cache,
-        "use_gate": not args.no_gate,
+        "use_cache": use_cache,
+        "use_gate": use_gate,
         "fixed_cache_weight": args.fixed_cache_weight,
+        "heads": args.heads,
+        "attention_mode": attention_mode,
+        "attention_window": args.attention_window,
+        "global_tokens": args.global_tokens,
     }
     train_step = make_train_step(cfg, args.lr, args.weight_decay)
     eval_step = make_eval_step(cfg)
@@ -541,6 +765,7 @@ def main() -> None:
         )
         print(
             f"dataset={args.dataset}/{args.dataset_config} split={eval_split} "
+            f"model={args.model} "
             f"vocab={vocab.size} train_tokens={len(train_ids):,} "
             f"eval_tokens={len(eval_ids):,} params={n_params:,}"
         )
@@ -596,9 +821,11 @@ def main() -> None:
                     args.log_jsonl,
                     {
                         "step": step,
+                        "model": args.model,
                         "params": n_params,
                         "seq_len": args.seq_len,
                         "global_batch_size": args.global_batch_size,
+                        "batch_size": args.global_batch_size,
                         "per_process_batch": per_process_batch,
                         "per_device_batch": train_batcher.per_device_batch,
                         "train_loss": train_loss,
@@ -614,15 +841,20 @@ def main() -> None:
                         "d_hidden": args.d_hidden,
                         "local_layers": args.local_layers,
                         "local_kernel_size": args.local_kernel_size,
+                        "layers": args.layers,
+                        "heads": args.heads,
+                        "attention_mode": attention_mode,
+                        "attention_window": args.attention_window,
+                        "global_tokens": args.global_tokens,
                         "num_buckets": args.num_buckets,
                         "top_k": args.top_k,
                         "context_order": args.context_order,
-                        "routing_mode": args.routing_mode,
+                        "routing_mode": routing_mode,
                         "semantic_buckets": args.semantic_buckets,
                         "semantic_temperature": args.semantic_temperature,
                         "semantic_score_scale": args.semantic_score_scale,
-                        "use_cache": not args.no_cache,
-                        "use_gate": not args.no_gate,
+                        "use_cache": use_cache,
+                        "use_gate": use_gate,
                     },
                 )
             last_log_time = now
