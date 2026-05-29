@@ -1,6 +1,9 @@
-\documentclass[10pt]{article}
+\documentclass{article}
+\usepackage{iclr2024_conference,times}
 
-\usepackage[margin=0.85in]{geometry}
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{graphicx}
@@ -9,7 +12,6 @@
 \usepackage{xcolor}
 \usepackage{hyperref}
 \usepackage{microtype}
-\usepackage[numbers,sort&compress]{natbib}
 \usepackage{float}
 
 \hypersetup{
@@ -19,10 +21,19 @@
   urlcolor=blue
 }
 
-\title{\vspace{-1.5em}Parallel Causal Associative Fields:\\
+\title{Parallel Causal Associative Fields:\\
 Gated Sparse Memory for Long-Context Language Modeling}
-\author{Anonymous}
-\date{}
+
+\author{Anonymous Authors \\
+Affiliation \\
+Address \\
+\texttt{email}
+}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but leave commented out for submission.
 
 \begin{document}
 \maketitle
@@ -612,7 +623,7 @@ parallel content-addressed memory is a promising architectural primitive for
 efficient long-context sequence modeling, and motivate scaling the approach to
 larger corpora, longer contexts, and full autoregressive evaluation.
 
-\bibliographystyle{plainnat}
+\bibliographystyle{iclr2024_conference}
 \bibliography{references}
 
 \end{document}
