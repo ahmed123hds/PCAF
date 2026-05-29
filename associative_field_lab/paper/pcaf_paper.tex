@@ -10,6 +10,7 @@
 \usepackage{hyperref}
 \usepackage{microtype}
 \usepackage[numbers,sort&compress]{natbib}
+\usepackage{float}
 
 \hypersetup{
   colorlinks=true,
@@ -196,7 +197,9 @@ indices.
 %%
 \section{Method}
 
-\begin{figure}[t]
+Figure~\ref{fig:architecture} illustrates the overall architecture of the proposed Parallel Causal Associative Field (PCAF) model. The architecture consists of a local parametric path running in parallel with a content-addressed associative memory module. Under this scheme, memory addressing and value resolution are decoupled, allowing fast subquadratic sequence processing with bounded candidate lookups.
+
+\begin{figure}[H]
   \centering
   \includegraphics[width=0.85\linewidth]{pcaf_architecture_diagram}
   \caption{Overall architecture of PCAF. Input tokens are embedded and processed by causal depthwise convolutional blocks (left, teal) to produce hidden states $h_{1:T}$. An MLP head maps $h_T$ to a parametric distribution $p_{\mathrm{param}}$. In parallel, a hash address function routes causal successor records into $B$ hash buckets (right, indigo). A Triton bucket lookup retrieves at most $K$ candidates $\mathcal{C}(T)$, which are scored via key--query attention to form a cache distribution $p_{\mathrm{cache}}$. A learned sigmoid gate $\lambda_T$ mixes the two distributions to produce the final output (top, amber).}
@@ -389,7 +392,7 @@ degrades sharply at 2048 tokens (577.4 perplexity at batch size 8, the largest
 feasible batch), confirming that full attention does not scale gracefully to
 longer contexts under this memory budget.
 
-\begin{table}[t]
+\begin{table}[H]
   \centering
   \caption{WikiText-2 next-token prediction at context length 1024. Lower
   perplexity is better. Best results in \textbf{bold}.}
@@ -411,7 +414,7 @@ longer contexts under this memory budget.
   }
 \end{table}
 
-\begin{table}[t]
+\begin{table}[H]
   \centering
   \caption{WikiText-2 next-token prediction at context length 2048.
   PCAF-context benefits from the longer context while sparse attention
@@ -453,12 +456,12 @@ proportional cost.
 
 To evaluate the scalability, efficiency, and modeling strength of PCAF against standard long-context Transformer baselines, we ported the language-modeling benchmark to a pure-JAX distributed implementation and conducted evaluations on a Google Cloud TPU v4-32 cluster. The TPU implementation uses \texttt{jax.pmap} across the available devices; unlike the CUDA implementation, it does not use Triton kernels.
 
-We trained and compared three classes of architectures on the large-scale \textbf{WikiText-103} dataset: standard dense Transformers, local and global-local attention models, and PCAF configurations (including the proposed context token-hash routing, continuous semantic-hash routing, and hybrid blends). All models are benchmarked across sequence lengths $T \in \{1024, 2048\}$. Table~\ref{tab:tpu_ablation} summarizes the perplexity, accuracy, and scaling throughput of this sweep, and Figure~\ref{fig:ablation_curves} displays the validation perplexity learning curves over training steps.
+We trained and compared three classes of architectures on the large-scale \textbf{WikiText-103} dataset: standard dense Transformers, local and global-local attention models, and PCAF configurations (including the proposed context token-hash routing, continuous semantic-hash routing, and hybrid blends). All models are benchmarked across sequence lengths $T \in \{1024, 2048\}$. Table~\ref{tab:tpu_baselines} summarizes the baseline comparisons, Table~\ref{tab:tpu_ablations} details the PCAF routing and gating ablations, and Figure~\ref{fig:ablation_curves} displays the validation perplexity learning curves over training steps.
 
-\begin{table}[t]
+\begin{table}[H]
   \centering
-  \caption{Distributed JAX scaling and baseline sweeps on a Google Cloud TPU v4-32 cluster on the WikiText-103 dataset. Throughput is reported in million tokens per second ($\text{M tok/s}$) across the full pod. Perplexities represent next-token prediction metrics.}
-  \label{tab:tpu_ablation}
+  \caption{Distributed JAX scaling baseline sweeps on a Google Cloud TPU v4-32 cluster on the WikiText-103 dataset. Throughput is reported in million tokens per second ($\text{M tok/s}$) across the full pod. Perplexities represent next-token prediction metrics.}
+  \label{tab:tpu_baselines}
   \resizebox{\linewidth}{!}{
   \begin{tabular}{llrrrrrrr}
     \toprule
@@ -473,7 +476,20 @@ We trained and compared three classes of architectures on the large-scale \textb
     \textbf{global\_local\_trans} & Global-Local ($w=128, g=16$) & 1024 & 41.51M & 207.33 & 207.33 & 0.2310 & 10.44 M tok/s & 4.67 \\
                                   &                              & 2048 & 41.71M & 287.39 & 287.39 & 0.2103 & 7.15 M tok/s & 6.67 \\
     \midrule
-    \textbf{local\_conv} (No cache) & --- & 2048 & 41.74M & 118.12 & 118.12 & 0.2676 & \textbf{45.82 M tok/s} & 4.18 \\
+    \textbf{local\_conv} (No cache) & --- & 2048 & 41.74M & 118.12 & 118.12 & 0.2676 & \textbf{45.82 M tok/s} & \textbf{4.18} \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[H]
+  \centering
+  \caption{Distributed JAX PCAF routing and gating ablations on a Google Cloud TPU v4-32 cluster on the WikiText-103 dataset.}
+  \label{tab:tpu_ablations}
+  \resizebox{\linewidth}{!}{
+  \begin{tabular}{llrrrrrrr}
+    \toprule
+    Model Class \& Config & Routing Mode & Seq. Len ($T$) & Params & Final PPL & Best PPL & Eval Acc. & Throughput & Elapsed (min) \\
     \midrule
     \textbf{pcaf\_no\_gate} & Fixed Cache Weight ($0.5$) & 2048 & 41.74M & 111.25 & 111.25 & 0.2591 & 38.72 M tok/s & 4.95 \\
     \midrule
@@ -483,21 +499,21 @@ We trained and compared three classes of architectures on the large-scale \textb
     \textbf{pcaf\_hybrid}   & Token + Semantic Mix & 1024 & 41.74M & 104.94 & 100.84 & 0.2661 & 22.20 M tok/s & 4.40 \\
                             &                      & 2048 & 41.74M & 104.90 & 101.84 & 0.2675 & 34.38 M tok/s & 5.54 \\
     \midrule
-    \textbf{pcaf\_context} (Proposed) & Context Token Hash Routing & 1024 & 41.74M & \textbf{99.20} & \textbf{96.45} & \textbf{0.2768} & 25.58 M tok/s & 3.79 \\
-                                      &                            & 2048 & 41.74M & \textbf{95.49} & \textbf{95.49} & \textbf{0.2804} & 38.92 M tok/s & 4.91 \\
+    \textbf{pcaf\_context} (Proposed) & Context Token Hash Routing & 1024 & 41.74M & \textbf{99.20} & \textbf{96.45} & \textbf{0.2768} & 25.58 M tok/s & \textbf{3.79} \\
+                                      &                            & 2048 & 41.74M & \textbf{95.49} & \textbf{95.49} & \textbf{0.2804} & \textbf{38.92 M tok/s} & 4.91 \\
     \bottomrule
   \end{tabular}
   }
 \end{table}
 
-\begin{figure}[t]
+\begin{figure}[H]
   \centering
   \includegraphics[width=\linewidth]{iclr_baselines_curves}
   \caption{Validation perplexity curves over training steps on WikiText-103 at sequence lengths $T = 1024$ (left) and $T = 2048$ (right) on a TPU v4-32 cluster. The proposed \textbf{pcaf\_context} routing achieves the lowest perplexity among the evaluated constant-depth associative variants and Transformer baselines.}
   \label{fig:ablation_curves}
 \end{figure}
 
-\begin{figure}[t]
+\begin{figure}[H]
   \centering
   \includegraphics[width=0.85\linewidth]{pcaf_throughput_chart}
   \caption{Training throughput comparison on WikiText-103 (TPU v4-32). PCAF variants achieve 3--5$\times$ higher throughput than Transformer baselines at both sequence lengths, with throughput \emph{increasing} at longer contexts due to improved data parallelism and the absence of quadratic attention.}
