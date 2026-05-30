@@ -414,11 +414,8 @@ def pcaf_forward(
 
     cand_tokens = jnp.take_along_axis(value_tokens, top_idx, axis=1)
 
-    gathered_keys = jnp.take_along_axis(
-        record_keys,
-        top_idx[:, :, None].repeat(record_keys.shape[-1], axis=2),
-        axis=1,
-    )
+    batch_idx = jnp.arange(tokens.shape[0])[:, None]  # [B, 1]
+    gathered_keys = record_keys[batch_idx, top_idx]    # [B, K, D]
     cache_scores = jnp.einsum("bkd,bd->bk", gathered_keys, query) * (d_model**-0.5)
     safe_idx = jnp.maximum(top_idx, 0)
     cache_scores = cache_scores + params["recency_scale"] * (
@@ -433,9 +430,8 @@ def pcaf_forward(
     weights = jax.nn.softmax(cache_scores, axis=1) * valid.astype(jnp.float32)
     weights = weights / jnp.maximum(jnp.sum(weights, axis=1, keepdims=True), 1.0e-6)
 
-    batch_ids = jnp.arange(tokens.shape[0])[:, None]
-    cache_probs = jnp.zeros((tokens.shape[0], vocab_size), dtype=jnp.float32)
-    cache_probs = cache_probs.at[batch_ids, cand_tokens].add(weights)
+    cache_probs = jnp.einsum("bk,bkv->bv", weights,
+                             jax.nn.one_hot(cand_tokens, vocab_size))
     cache_log_probs = jnp.log(jnp.maximum(cache_probs, 1.0e-6))
 
     if use_gate:
