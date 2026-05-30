@@ -466,6 +466,52 @@ def attention_mask(seq_len: int, *, attention_mode: str, window_size: int, globa
     return allowed
 
 
+def causal_linear_attention_chunked(q, k, v, *, chunk_size: int):
+    """Causal linear attention without materializing [B, H, T, D, D] prefixes."""
+    bsz, heads, seq_len, head_dim = q.shape
+    chunk_size = min(int(chunk_size), seq_len)
+    pad_len = (-seq_len) % chunk_size
+    if pad_len:
+        pad_spec = ((0, 0), (0, 0), (0, pad_len), (0, 0))
+        q = jnp.pad(q, pad_spec)
+        k = jnp.pad(k, pad_spec)
+        v = jnp.pad(v, pad_spec)
+
+    padded_len = q.shape[2]
+    num_chunks = padded_len // chunk_size
+    q = q.reshape(bsz, heads, num_chunks, chunk_size, head_dim)
+    k = k.reshape(bsz, heads, num_chunks, chunk_size, head_dim)
+    v = v.reshape(bsz, heads, num_chunks, chunk_size, head_dim)
+
+    chunk_k = jnp.sum(k, axis=3)
+    chunk_kv = jnp.einsum("bhncd,bhnce->bhnde", k, v)
+    prefix_k = jnp.concatenate(
+        [jnp.zeros_like(chunk_k[:, :, :1, :]), jnp.cumsum(chunk_k, axis=2)[:, :, :-1, :]],
+        axis=2,
+    )
+    prefix_kv = jnp.concatenate(
+        [
+            jnp.zeros_like(chunk_kv[:, :, :1, :, :]),
+            jnp.cumsum(chunk_kv, axis=2)[:, :, :-1, :, :],
+        ],
+        axis=2,
+    )
+
+    cross_numer = jnp.einsum("bhncd,bhnde->bhnce", q, prefix_kv)
+    cross_denom = jnp.einsum("bhncd,bhnd->bhnc", q, prefix_k)
+
+    local_scores = jnp.einsum("bhncd,bhned->bhnce", q, k)
+    local_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_))
+    local_scores = jnp.where(local_mask[None, None, None, :, :], local_scores, 0.0)
+    local_numer = jnp.einsum("bhnce,bhned->bhncd", local_scores, v)
+    local_denom = jnp.sum(local_scores, axis=-1)
+
+    out = (cross_numer + local_numer) / jnp.maximum(
+        (cross_denom + local_denom)[..., None], 1.0e-6
+    )
+    return out.reshape(bsz, heads, padded_len, head_dim)[:, :, :seq_len, :]
+
+
 def transformer_block_forward(
     block,
     x,
@@ -474,6 +520,7 @@ def transformer_block_forward(
     attention_mode: str,
     window_size: int,
     global_tokens: int,
+    linear_chunk_size: int,
 ):
     bsz, seq_len, d_model = x.shape
     head_dim = d_model // heads
@@ -488,12 +535,9 @@ def transformer_block_forward(
     if attention_mode == "linear":
         q_phi = jax.nn.elu(q) + 1.0
         k_phi = jax.nn.elu(k) + 1.0
-        kv = k_phi[..., :, :, None] * v[..., :, None, :]
-        prefix_kv = jnp.cumsum(kv, axis=2)
-        prefix_k = jnp.cumsum(k_phi, axis=2)
-        numer = jnp.einsum("bhtd,bhtde->bhte", q_phi, prefix_kv)
-        denom = jnp.einsum("bhtd,bhtd->bht", q_phi, prefix_k)
-        attn = numer / jnp.maximum(denom[..., None], 1.0e-6)
+        attn = causal_linear_attention_chunked(
+            q_phi, k_phi, v, chunk_size=linear_chunk_size
+        )
     else:
         scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
         allowed = attention_mask(
@@ -522,6 +566,7 @@ def transformer_forward(
     attention_mode: str,
     window_size: int,
     global_tokens: int,
+    linear_chunk_size: int,
 ):
     seq_len = tokens.shape[1]
     x = params["emb"][tokens] + params["pos"][None, :seq_len, :]
@@ -533,6 +578,7 @@ def transformer_forward(
             attention_mode=attention_mode,
             window_size=window_size,
             global_tokens=global_tokens,
+            linear_chunk_size=linear_chunk_size,
         )
     h = layer_norm(x[:, -1, :], params["head_ln_scale"], params["head_ln_bias"])
     h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
@@ -548,6 +594,7 @@ def loss_and_metrics(params, tokens, targets, cfg):
             attention_mode=cfg["attention_mode"],
             window_size=cfg["attention_window"],
             global_tokens=cfg["global_tokens"],
+            linear_chunk_size=cfg["linear_chunk_size"],
         )
     else:
         log_probs = pcaf_forward(
@@ -662,6 +709,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--attention-window", type=int, default=128)
     parser.add_argument("--global-tokens", type=int, default=16)
+    parser.add_argument("--linear-chunk-size", type=int, default=64)
     parser.add_argument("--num-buckets", type=int, default=32768)
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--context-order", type=int, default=1)
@@ -789,6 +837,7 @@ def main() -> None:
         "attention_mode": attention_mode,
         "attention_window": args.attention_window,
         "global_tokens": args.global_tokens,
+        "linear_chunk_size": args.linear_chunk_size,
     }
     train_step = make_train_step(cfg, args.lr, args.weight_decay)
     eval_step = make_eval_step(cfg)
@@ -895,6 +944,7 @@ def main() -> None:
                         "attention_mode": attention_mode,
                         "attention_window": args.attention_window,
                         "global_tokens": args.global_tokens,
+                        "linear_chunk_size": args.linear_chunk_size,
                         "num_buckets": args.num_buckets,
                         "top_k": args.top_k,
                         "context_order": args.context_order,

@@ -14,6 +14,8 @@ The TPU path differs from the CUDA path:
 - `--model` supports `local_conv`, `pcaf_no_gate`, `pcaf_semantic`,
   `pcaf_hybrid`, `pcaf_context`, `transformer_dense`, `linear_attention`,
   `local_transformer`, and `global_local_transformer`
+- `linear_attention` uses chunked causal kernel attention via
+  `--linear-chunk-size` instead of materializing full prefix tensors
 - the model trains a single next-token target after each sampled context window,
   matching the current PyTorch experiment
 

@@ -59,6 +59,7 @@ ATTN_LAYERS="${ATTN_LAYERS:-4}"
 ATTN_HEADS="${ATTN_HEADS:-4}"
 ATTN_WINDOW="${ATTN_WINDOW:-128}"
 GLOBAL_TOKENS="${GLOBAL_TOKENS:-16}"
+LINEAR_CHUNK_SIZE="${LINEAR_CHUNK_SIZE:-64}"
 
 TRAIN_SAMPLE_SEED="${TRAIN_SAMPLE_SEED:-10001}"
 EVAL_SAMPLE_SEED="${EVAL_SAMPLE_SEED:-20001}"
@@ -257,6 +258,7 @@ run_attention_family() {
       --d-hidden "$ATTN_D_HIDDEN" \
       --layers "$ATTN_LAYERS" \
       --heads "$ATTN_HEADS" \
+      --linear-chunk-size "$LINEAR_CHUNK_SIZE" \
       --attention-window "$ATTN_WINDOW" \
       --global-tokens "$GLOBAL_TOKENS"
   fi
