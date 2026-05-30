@@ -155,7 +155,8 @@ bash associative_field_lab/scripts/run_tpu_iclr_full_package.sh
 
 This runs the 50k-step WikiText-103 comparison, a PG-19 transfer check, the
 PCAF top-k/bucket/context/sequence-length ablation grid, and writes
-`iclr_audit.md`.
+`iclr_audit.md`. The PG-19 stage defaults to `emozilla/pg19`, a parquet-backed
+mirror compatible with current Hugging Face `datasets`.
 
 From your local machine, launch it on every v4-32 worker:
 

@@ -507,7 +507,9 @@ bash associative_field_lab/scripts/run_tpu_iclr_baselines.sh
 
 For the full ICLR evidence package, run the longer wrapper. It adds a 50k-step
 WikiText-103 comparison, a PG-19 transfer check, a PCAF top-k/bucket/context
-ablation grid, and a machine-readable audit report:
+ablation grid, and a machine-readable audit report. The PG-19 stage uses the
+parquet-backed `emozilla/pg19` mirror by default because modern Hugging Face
+`datasets` rejects the older script-backed `deepmind/pg19` loader.
 
 The TPU `linear_attention` baseline uses chunked causal kernel attention
 (`LINEAR_CHUNK_SIZE=64` by default) so it does not materialize the full
