@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,13 @@ class ImageBatcher:
         per_process_batch: int,
         local_device_count: int,
         seed: int,
+        train: bool,
+        augment: bool,
+        crop_padding: int,
+        hflip_prob: float,
+        cutout_size: int,
+        mixup_alpha: float,
+        num_classes: int,
     ) -> None:
         if per_process_batch % local_device_count != 0:
             raise ValueError("per-process batch must divide local_device_count")
@@ -50,13 +58,58 @@ class ImageBatcher:
         self.local_device_count = local_device_count
         self.per_device_batch = per_process_batch // local_device_count
         self.rng = np.random.default_rng(seed)
+        self.train = train
+        self.augment = augment
+        self.crop_padding = crop_padding
+        self.hflip_prob = hflip_prob
+        self.cutout_size = cutout_size
+        self.mixup_alpha = mixup_alpha
+        self.num_classes = num_classes
 
     def sample(self) -> tuple[np.ndarray, np.ndarray]:
         idx = self.rng.integers(0, self.images.shape[0], size=(self.per_process_batch,))
-        images = self.images[idx]
+        images = self.images[idx].copy()
         labels = self.labels[idx]
+        if self.train and self.augment:
+            images = self._augment(images)
+        if self.train and self.mixup_alpha > 0.0:
+            labels = self._mixup(images, labels)
         shard = (self.local_device_count, self.per_device_batch)
-        return images.reshape(*shard, *images.shape[1:]), labels.reshape(*shard)
+        return images.reshape(*shard, *images.shape[1:]), labels.reshape(*shard, *labels.shape[1:])
+
+    def _augment(self, images: np.ndarray) -> np.ndarray:
+        if self.crop_padding > 0:
+            pad = self.crop_padding
+            padded = np.pad(images, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
+            crop_y = self.rng.integers(0, 2 * pad + 1, size=(images.shape[0],))
+            crop_x = self.rng.integers(0, 2 * pad + 1, size=(images.shape[0],))
+            cropped = np.empty_like(images)
+            for i, (y, x) in enumerate(zip(crop_y, crop_x)):
+                cropped[i] = padded[i, :, y : y + 32, x : x + 32]
+            images = cropped
+        if self.hflip_prob > 0.0:
+            flip = self.rng.random(images.shape[0]) < self.hflip_prob
+            images[flip] = images[flip, :, :, ::-1]
+        if self.cutout_size > 0:
+            cut = min(self.cutout_size, images.shape[-1])
+            half = cut // 2
+            cy = self.rng.integers(0, images.shape[-2], size=(images.shape[0],))
+            cx = self.rng.integers(0, images.shape[-1], size=(images.shape[0],))
+            for i, (y, x) in enumerate(zip(cy, cx)):
+                y0 = max(y - half, 0)
+                y1 = min(y0 + cut, images.shape[-2])
+                x0 = max(x - half, 0)
+                x1 = min(x0 + cut, images.shape[-1])
+                images[i, :, y0:y1, x0:x1] = 0.0
+        return images
+
+    def _mixup(self, images: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        perm = self.rng.permutation(images.shape[0])
+        lam = float(self.rng.beta(self.mixup_alpha, self.mixup_alpha))
+        images[:] = lam * images + (1.0 - lam) * images[perm]
+        target = np.eye(self.num_classes, dtype=np.float32)[labels]
+        target_perm = np.eye(self.num_classes, dtype=np.float32)[labels[perm]]
+        return lam * target + (1.0 - lam) * target_perm
 
 
 def preprocess_split(
@@ -213,13 +266,23 @@ def vision_forward(params, images, cfg):
 
 def loss_and_metrics(params, images, labels, cfg):
     logits = vision_forward(params, images, cfg)
-    loss = -jnp.mean(jax.nn.log_softmax(logits, axis=-1)[jnp.arange(labels.shape[0]), labels])
-    acc = jnp.mean((jnp.argmax(logits, axis=-1) == labels).astype(jnp.float32))
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    if labels.ndim == 2:
+        targets = labels.astype(jnp.float32)
+        hard_labels = jnp.argmax(targets, axis=-1)
+    else:
+        hard_labels = labels
+        targets = jax.nn.one_hot(labels, cfg["num_classes"], dtype=jnp.float32)
+    if cfg["label_smoothing"] > 0.0:
+        smooth = cfg["label_smoothing"]
+        targets = targets * (1.0 - smooth) + smooth / cfg["num_classes"]
+    loss = -jnp.mean(jnp.sum(targets * log_probs, axis=-1))
+    acc = jnp.mean((jnp.argmax(logits, axis=-1) == hard_labels).astype(jnp.float32))
     return loss, {"loss": loss, "acc": acc}
 
 
-def make_train_step(cfg, lr: float, weight_decay: float):
-    def train_step(params, opt_state, images, labels):
+def make_train_step(cfg, weight_decay: float):
+    def train_step(params, opt_state, images, labels, lr):
         (loss, metrics), grads = jax.value_and_grad(loss_and_metrics, has_aux=True)(
             params, images, labels, cfg
         )
@@ -228,6 +291,8 @@ def make_train_step(cfg, lr: float, weight_decay: float):
         params, opt_state = adamw_update(
             params, grads, opt_state, lr=lr, weight_decay=weight_decay
         )
+        metrics = dict(metrics)
+        metrics["lr"] = lax.pmean(lr, axis_name="data")
         return params, opt_state, metrics
 
     return jax.pmap(train_step, axis_name="data", donate_argnums=(0, 1))
@@ -250,6 +315,24 @@ def append_jsonl(path: str, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def learning_rate_at_step(
+    step: int,
+    *,
+    base_lr: float,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_lr * step / warmup_steps
+    if total_steps <= warmup_steps:
+        return base_lr
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="JAX TPU Vision PCAF on CIFAR")
     parser.add_argument("--jax-distributed", action="store_true")
@@ -266,10 +349,18 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--eval-batches", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--train-sample-seed", type=int, default=10001)
     parser.add_argument("--eval-sample-seed", type=int, default=20001)
+    parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument("--crop-padding", type=int, default=4)
+    parser.add_argument("--hflip-prob", type=float, default=0.5)
+    parser.add_argument("--cutout-size", type=int, default=8)
+    parser.add_argument("--mixup-alpha", type=float, default=0.0)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--d-hidden", type=int, default=1024)
@@ -313,6 +404,11 @@ def main() -> None:
         class_subset=args.class_subset,
         max_examples=args.max_eval_examples,
     )
+    num_classes = (
+        args.class_subset
+        if args.class_subset > 0
+        else int(max(train_labels.max(), eval_labels.max())) + 1
+    )
 
     train_batcher = ImageBatcher(
         train_images,
@@ -320,6 +416,13 @@ def main() -> None:
         per_process_batch=per_process_batch,
         local_device_count=local_device_count,
         seed=args.train_sample_seed + process_index,
+        train=True,
+        augment=not args.no_augment,
+        crop_padding=args.crop_padding,
+        hflip_prob=args.hflip_prob,
+        cutout_size=args.cutout_size,
+        mixup_alpha=args.mixup_alpha,
+        num_classes=num_classes,
     )
     eval_batcher = ImageBatcher(
         eval_images,
@@ -327,11 +430,17 @@ def main() -> None:
         per_process_batch=per_process_batch,
         local_device_count=local_device_count,
         seed=args.eval_sample_seed + process_index,
+        train=False,
+        augment=False,
+        crop_padding=0,
+        hflip_prob=0.0,
+        cutout_size=0,
+        mixup_alpha=0.0,
+        num_classes=num_classes,
     )
 
     num_patches = (32 // args.patch_size) ** 2
     patch_dim = 3 * args.patch_size * args.patch_size
-    num_classes = args.class_subset
     params = init_vision_params(
         random.PRNGKey(args.seed),
         patch_dim=patch_dim,
@@ -370,20 +479,38 @@ def main() -> None:
         "use_gate": use_gate,
         "fixed_cache_weight": args.fixed_cache_weight,
         "scale": args.d_model**-0.5,
+        "num_classes": num_classes,
+        "label_smoothing": args.label_smoothing,
     }
-    train_step = make_train_step(cfg, args.lr, args.weight_decay)
-    eval_step = make_eval_step(cfg)
+    eval_cfg = dict(cfg)
+    eval_cfg["label_smoothing"] = 0.0
+    train_step = make_train_step(cfg, args.weight_decay)
+    eval_step = make_eval_step(eval_cfg)
 
     if process_index == 0:
         print(f"jax_devices={jax.device_count()} local_devices={local_device_count} processes={process_count} process_index={process_index}")
         print(f"dataset={args.dataset} split={eval_split} model={args.model} classes={num_classes} params={n_params:,}")
         print(f"global_batch={args.global_batch_size} per_process_batch={per_process_batch}")
+        print(
+            f"augment={not args.no_augment} crop_padding={args.crop_padding} "
+            f"hflip_prob={args.hflip_prob} cutout_size={args.cutout_size} "
+            f"mixup_alpha={args.mixup_alpha} label_smoothing={args.label_smoothing} "
+            f"warmup_steps={args.warmup_steps} min_lr_ratio={args.min_lr_ratio}"
+        )
 
     start = time.perf_counter()
     for step in range(1, args.steps + 1):
         step_start = time.perf_counter()
         images, labels = train_batcher.sample()
-        params, opt_state, train_metrics = train_step(params, opt_state, images, labels)
+        lr = learning_rate_at_step(
+            step,
+            base_lr=args.lr,
+            total_steps=args.steps,
+            warmup_steps=args.warmup_steps,
+            min_lr_ratio=args.min_lr_ratio,
+        )
+        lr_shard = np.full((local_device_count,), lr, dtype=np.float32)
+        params, opt_state, train_metrics = train_step(params, opt_state, images, labels, lr_shard)
         train_step_sec = time.perf_counter() - step_start
         if step == 1 or step % args.eval_every == 0:
             eval_loss = 0.0
@@ -404,6 +531,7 @@ def main() -> None:
                     f"step={step:05d} loss={metric_scalar(train_metrics, 'loss'):.4f} "
                     f"train_acc={metric_scalar(train_metrics, 'acc'):.4f} "
                     f"eval_loss={eval_loss:.4f} eval_acc={eval_acc:.4f} "
+                    f"lr={metric_scalar(train_metrics, 'lr'):.6g} "
                     f"train_step_sec={train_step_sec:.4f} img_per_sec={img_per_sec:.1f} "
                     f"eval_sec={eval_sec:.2f} elapsed_min={elapsed / 60.0:.2f}"
                 )
@@ -418,10 +546,17 @@ def main() -> None:
                         "train_acc": metric_scalar(train_metrics, "acc"),
                         "eval_loss": eval_loss,
                         "eval_acc": eval_acc,
+                        "lr": metric_scalar(train_metrics, "lr"),
                         "train_step_sec": train_step_sec,
                         "img_per_sec": img_per_sec,
                         "eval_sec": eval_sec,
                         "elapsed_min": elapsed / 60.0,
+                        "augment": not args.no_augment,
+                        "crop_padding": args.crop_padding,
+                        "hflip_prob": args.hflip_prob,
+                        "cutout_size": args.cutout_size,
+                        "mixup_alpha": args.mixup_alpha,
+                        "label_smoothing": args.label_smoothing,
                     },
                 )
 
