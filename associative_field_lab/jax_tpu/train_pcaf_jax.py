@@ -360,75 +360,6 @@ def route_top_k(scores, k: int, *, route_top_k_mode: str, approx_recall_target: 
     return lax.top_k(scores, k)
 
 
-def previous_indices_for_query_buckets(
-    record_buckets,
-    query_buckets,
-    *,
-    top_k: int,
-    num_buckets: int,
-):
-    """Return previous positions from the same learned buckets.
-
-    This is a parallel inverted-index construction. It avoids materializing a
-    [B, T, T] semantic similarity matrix for full-AR routing.
-    """
-    bsz, seq_len = record_buckets.shape
-    query_bucket_count = query_buckets.shape[-1]
-    one_hot = jax.nn.one_hot(record_buckets, num_buckets, dtype=jnp.int32)
-    prefix = jnp.cumsum(one_hot, axis=1)
-    prefix_before = jnp.concatenate(
-        [jnp.zeros_like(prefix[:, :1, :]), prefix[:, :-1, :]], axis=1
-    )
-    record_rank = jnp.take_along_axis(
-        prefix - 1, record_buckets[..., None], axis=2
-    )[..., 0]
-
-    pos_by_rank = -jnp.ones((bsz, num_buckets, seq_len), dtype=jnp.int32)
-    batch_idx_2d = jnp.arange(bsz)[:, None]
-    time_idx = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-    pos_by_rank = pos_by_rank.at[batch_idx_2d, record_buckets, record_rank].set(time_idx)
-
-    count_before = jnp.take_along_axis(prefix_before, query_buckets, axis=2)
-    offsets = jnp.arange(1, top_k + 1, dtype=jnp.int32)
-    prev_rank = count_before[..., None] - offsets
-    valid = prev_rank >= 0
-    safe_rank = jnp.maximum(prev_rank, 0)
-
-    batch_idx = jnp.arange(bsz)[:, None, None, None]
-    candidate_idx = pos_by_rank[batch_idx, query_buckets[..., None], safe_rank]
-    candidate_idx = jnp.where(valid, candidate_idx, -1)
-    return (
-        candidate_idx.reshape(bsz, seq_len, query_bucket_count * top_k),
-        valid.reshape(bsz, seq_len, query_bucket_count * top_k),
-    )
-
-
-def semantic_bucket_candidates(
-    semantic_logits,
-    *,
-    top_k: int,
-    semantic_query_buckets: int,
-    semantic_temperature: float,
-):
-    temp = max(float(semantic_temperature), 1.0e-4)
-    probs = jax.nn.softmax(semantic_logits / temp, axis=-1)
-    record_buckets = jnp.argmax(semantic_logits, axis=-1).astype(jnp.int32)
-    query_scores, query_buckets = lax.top_k(
-        probs, min(int(semantic_query_buckets), semantic_logits.shape[-1])
-    )
-    candidate_idx, valid = previous_indices_for_query_buckets(
-        record_buckets,
-        query_buckets.astype(jnp.int32),
-        top_k=top_k,
-        num_buckets=semantic_logits.shape[-1],
-    )
-    route_scores = jnp.repeat(query_scores[..., None], top_k, axis=-1).reshape(
-        candidate_idx.shape
-    )
-    route_scores = jnp.where(valid, route_scores, 0.0)
-    return candidate_idx, valid, route_scores
-
-
 def pcaf_forward(
     params,
     tokens,
@@ -442,8 +373,6 @@ def pcaf_forward(
     semantic_buckets: int,
     semantic_temperature: float,
     semantic_score_scale: float,
-    semantic_candidate_mode: str,
-    semantic_query_buckets: int,
     use_cache: bool,
     use_gate: bool,
     fixed_cache_weight: float,
@@ -472,37 +401,24 @@ def pcaf_forward(
 
     semantic_route_scores = None
     if routing_mode in {"semantic_hash", "hybrid_semantic_hash"}:
-        semantic_logits = x @ params["semantic_w"] + params["semantic_b"]
-        if semantic_candidate_mode == "bucket" and routing_mode == "semantic_hash":
-            semantic_top_idx, semantic_valid_full, semantic_route_scores = semantic_bucket_candidates(
-                semantic_logits,
-                top_k=top_k,
-                semantic_query_buckets=semantic_query_buckets,
-                semantic_temperature=semantic_temperature,
-            )
-            semantic_top_idx = semantic_top_idx[:, -1, :]
-            semantic_valid = semantic_valid_full[:, -1, :]
-            semantic_route_scores = semantic_route_scores[:, -1, :]
-        else:
-            record_sem_logits = semantic_logits[:, :-1, :]
-            query_sem_logits = semantic_logits[:, -1, :]
-            temp = max(float(semantic_temperature), 1.0e-4)
-            record_sem = jax.nn.softmax(record_sem_logits / temp, axis=-1)
-            query_sem = jax.nn.softmax(query_sem_logits / temp, axis=-1)
-            record_sem = cache_compute_cast(record_sem, cache_dtype)
-            query_sem = cache_compute_cast(query_sem, cache_dtype)
-            semantic_scores = jnp.einsum("bnc,bc->bn", record_sem, query_sem).astype(jnp.float32)
-            semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, :]
-            semantic_top_scores, semantic_top_idx = route_top_k(
-                semantic_rank_scores,
-                top_k,
-                route_top_k_mode=route_top_k_mode,
-                approx_recall_target=approx_recall_target,
-            )
-            semantic_valid = semantic_top_scores > -1.0e8
-            semantic_route_scores = jnp.take_along_axis(
-                semantic_scores, semantic_top_idx, axis=1
-            )
+        record_sem_logits = x[:, :-1, :] @ params["semantic_w"] + params["semantic_b"]
+        query_sem_logits = final_state @ params["semantic_w"] + params["semantic_b"]
+        temp = max(float(semantic_temperature), 1.0e-4)
+        record_sem = jax.nn.softmax(record_sem_logits / temp, axis=-1)
+        query_sem = jax.nn.softmax(query_sem_logits / temp, axis=-1)
+        record_sem = cache_compute_cast(record_sem, cache_dtype)
+        query_sem = cache_compute_cast(query_sem, cache_dtype)
+        semantic_scores = jnp.einsum("bnc,bc->bn", record_sem, query_sem).astype(jnp.float32)
+        semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, :]
+        semantic_top_scores, semantic_top_idx = route_top_k(
+            semantic_rank_scores,
+            top_k,
+            route_top_k_mode=route_top_k_mode,
+            approx_recall_target=approx_recall_target,
+        )
+        semantic_route_scores = jnp.take_along_axis(
+            semantic_scores, semantic_top_idx, axis=1
+        )
 
     if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, context_order)
@@ -527,7 +443,7 @@ def pcaf_forward(
 
     if routing_mode == "semantic_hash":
         top_idx = semantic_top_idx
-        valid = semantic_valid
+        valid = jnp.ones_like(top_idx, dtype=jnp.bool_)
         candidate_route_scores = semantic_route_scores
     elif routing_mode == "hybrid_semantic_hash":
         top_idx = jnp.concatenate([token_top_idx, semantic_top_idx], axis=1)
@@ -543,14 +459,14 @@ def pcaf_forward(
         valid = token_valid
         candidate_route_scores = None
 
-    safe_top_idx = jnp.maximum(top_idx, 0)
-    cand_tokens = jnp.take_along_axis(value_tokens, safe_top_idx, axis=1)
+    cand_tokens = jnp.take_along_axis(value_tokens, top_idx, axis=1)
 
     batch_idx = jnp.arange(tokens.shape[0])[:, None]  # [B, 1]
-    gathered_keys = record_keys[batch_idx, safe_top_idx]    # [B, K, D]
+    gathered_keys = record_keys[batch_idx, top_idx]    # [B, K, D]
     cache_scores = jnp.einsum("bkd,bd->bk", gathered_keys, query).astype(jnp.float32) * (d_model**-0.5)
+    safe_idx = jnp.maximum(top_idx, 0)
     cache_scores = cache_scores + params["recency_scale"] * (
-        safe_top_idx.astype(jnp.float32) / jnp.maximum(float(n_records - 1), 1.0)
+        safe_idx.astype(jnp.float32) / jnp.maximum(float(n_records - 1), 1.0)
     )
     if candidate_route_scores is not None:
         cache_scores = cache_scores + semantic_score_scale * jnp.log(
@@ -592,8 +508,6 @@ def pcaf_forward_full_ar_target_log_probs(
     semantic_buckets: int,
     semantic_temperature: float,
     semantic_score_scale: float,
-    semantic_candidate_mode: str,
-    semantic_query_buckets: int,
     use_cache: bool,
     use_gate: bool,
     fixed_cache_weight: float,
@@ -639,30 +553,22 @@ def pcaf_forward_full_ar_target_log_probs(
     semantic_route_scores = None
     if routing_mode in {"semantic_hash", "hybrid_semantic_hash"}:
         sem_logits = x @ params["semantic_w"] + params["semantic_b"]
-        if semantic_candidate_mode == "bucket" and routing_mode == "semantic_hash":
-            semantic_top_idx, semantic_valid, semantic_route_scores = semantic_bucket_candidates(
-                sem_logits,
-                top_k=top_k,
-                semantic_query_buckets=semantic_query_buckets,
-                semantic_temperature=semantic_temperature,
-            )
-        else:
-            temp = max(float(semantic_temperature), 1.0e-4)
-            sem = jax.nn.softmax(sem_logits / temp, axis=-1)
-            sem = cache_compute_cast(sem, cache_dtype)
-            semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem).astype(jnp.float32)
-            semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
-            semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
-            semantic_top_scores, semantic_top_idx = route_top_k(
-                semantic_rank_scores,
-                top_k,
-                route_top_k_mode=route_top_k_mode,
-                approx_recall_target=approx_recall_target,
-            )
-            semantic_valid = semantic_top_scores > -1.0e8
-            semantic_route_scores = jnp.take_along_axis(
-                semantic_scores, semantic_top_idx, axis=2
-            )
+        temp = max(float(semantic_temperature), 1.0e-4)
+        sem = jax.nn.softmax(sem_logits / temp, axis=-1)
+        sem = cache_compute_cast(sem, cache_dtype)
+        semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem).astype(jnp.float32)
+        semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
+        semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
+        semantic_top_scores, semantic_top_idx = route_top_k(
+            semantic_rank_scores,
+            top_k,
+            route_top_k_mode=route_top_k_mode,
+            approx_recall_target=approx_recall_target,
+        )
+        semantic_valid = semantic_top_scores > -1.0e8
+        semantic_route_scores = jnp.take_along_axis(
+            semantic_scores, semantic_top_idx, axis=2
+        )
 
     if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, context_order)
@@ -702,13 +608,13 @@ def pcaf_forward_full_ar_target_log_probs(
         candidate_route_scores = None
 
     batch_idx = jnp.arange(bsz)[:, None, None]
-    safe_top_idx = jnp.maximum(top_idx, 0)
-    gathered_keys = record_keys[batch_idx, safe_top_idx]
-    cand_tokens = value_tokens[batch_idx, safe_top_idx]
+    gathered_keys = record_keys[batch_idx, top_idx]
+    cand_tokens = value_tokens[batch_idx, top_idx]
 
     cache_scores = jnp.einsum("btkd,btd->btk", gathered_keys, query).astype(jnp.float32) * (d_model**-0.5)
+    safe_idx = jnp.maximum(top_idx, 0)
     cache_scores = cache_scores + params["recency_scale"] * (
-        safe_top_idx.astype(jnp.float32) / jnp.maximum(float(seq_len - 1), 1.0)
+        safe_idx.astype(jnp.float32) / jnp.maximum(float(seq_len - 1), 1.0)
     )
     if candidate_route_scores is not None:
         cache_scores = cache_scores + semantic_score_scale * jnp.log(
@@ -917,8 +823,6 @@ def loss_and_metrics(params, tokens, targets, cfg):
                 semantic_buckets=cfg["semantic_buckets"],
                 semantic_temperature=cfg["semantic_temperature"],
                 semantic_score_scale=cfg["semantic_score_scale"],
-                semantic_candidate_mode=cfg["semantic_candidate_mode"],
-                semantic_query_buckets=cfg["semantic_query_buckets"],
                 use_cache=cfg["use_cache"],
                 use_gate=cfg["use_gate"],
                 fixed_cache_weight=cfg["fixed_cache_weight"],
@@ -952,8 +856,6 @@ def loss_and_metrics(params, tokens, targets, cfg):
             semantic_buckets=cfg["semantic_buckets"],
             semantic_temperature=cfg["semantic_temperature"],
             semantic_score_scale=cfg["semantic_score_scale"],
-            semantic_candidate_mode=cfg["semantic_candidate_mode"],
-            semantic_query_buckets=cfg["semantic_query_buckets"],
             use_cache=cfg["use_cache"],
             use_gate=cfg["use_gate"],
             fixed_cache_weight=cfg["fixed_cache_weight"],
@@ -1076,18 +978,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-buckets", type=int, default=256)
     parser.add_argument("--semantic-temperature", type=float, default=0.2)
     parser.add_argument("--semantic-score-scale", type=float, default=1.0)
-    parser.add_argument(
-        "--semantic-candidate-mode",
-        choices=["dense", "bucket"],
-        default="dense",
-        help="dense uses all-pairs semantic routing; bucket uses a parallel learned inverted index.",
-    )
-    parser.add_argument(
-        "--semantic-query-buckets",
-        type=int,
-        default=1,
-        help="Number of top semantic buckets queried per token in bucket mode.",
-    )
     parser.add_argument(
         "--route-top-k",
         choices=["exact", "approx"],
@@ -1215,8 +1105,6 @@ def main() -> None:
         "semantic_buckets": args.semantic_buckets,
         "semantic_temperature": args.semantic_temperature,
         "semantic_score_scale": args.semantic_score_scale,
-        "semantic_candidate_mode": args.semantic_candidate_mode,
-        "semantic_query_buckets": args.semantic_query_buckets,
         "route_top_k": args.route_top_k,
         "approx_recall_target": args.approx_recall_target,
         "cache_dtype": args.cache_dtype,
@@ -1252,9 +1140,7 @@ def main() -> None:
         print(
             f"route_top_k={args.route_top_k} "
             f"approx_recall_target={args.approx_recall_target} "
-            f"cache_dtype={args.cache_dtype} "
-            f"semantic_candidate_mode={args.semantic_candidate_mode} "
-            f"semantic_query_buckets={args.semantic_query_buckets}"
+            f"cache_dtype={args.cache_dtype}"
         )
 
     run_start = time.perf_counter()
@@ -1351,8 +1237,6 @@ def main() -> None:
                         "semantic_buckets": args.semantic_buckets,
                         "semantic_temperature": args.semantic_temperature,
                         "semantic_score_scale": args.semantic_score_scale,
-                        "semantic_candidate_mode": args.semantic_candidate_mode,
-                        "semantic_query_buckets": args.semantic_query_buckets,
                         "route_top_k": args.route_top_k,
                         "approx_recall_target": args.approx_recall_target,
                         "cache_dtype": args.cache_dtype,
