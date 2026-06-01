@@ -49,6 +49,7 @@ class HostBatcher:
         per_process_batch: int,
         local_device_count: int,
         seed: int,
+        full_ar: bool = False,
     ) -> None:
         if per_process_batch % local_device_count != 0:
             raise ValueError("per-process batch must divide local_device_count")
@@ -61,6 +62,7 @@ class HostBatcher:
         self.per_device_batch = per_process_batch // local_device_count
         self.rng = np.random.default_rng(seed)
         self.offsets = np.arange(seq_len + 1, dtype=np.int64)
+        self.full_ar = full_ar
 
     def sample(self) -> tuple[np.ndarray, np.ndarray]:
         starts = self.rng.integers(
@@ -71,11 +73,12 @@ class HostBatcher:
         )
         block = self.data[starts[:, None] + self.offsets[None, :]]
         tokens = block[:, :-1]
-        targets = block[:, -1]
+        targets = block[:, 1:] if self.full_ar else block[:, -1]
         shard_shape = (self.local_device_count, self.per_device_batch)
+        target_shape = (self.seq_len,) if self.full_ar else ()
         return (
             tokens.reshape(*shard_shape, self.seq_len),
-            targets.reshape(*shard_shape),
+            targets.reshape(*shard_shape, *target_shape),
         )
 
 
@@ -447,6 +450,141 @@ def pcaf_forward(
     return jnp.logaddexp(jnp.log1p(-gate) + param_log_probs, jnp.log(gate) + cache_log_probs)
 
 
+def pcaf_forward_full_ar_target_log_probs(
+    params,
+    tokens,
+    targets,
+    *,
+    vocab_size: int,
+    d_model: int,
+    num_buckets: int,
+    top_k: int,
+    context_order: int,
+    routing_mode: str,
+    semantic_buckets: int,
+    semantic_temperature: float,
+    semantic_score_scale: float,
+    use_cache: bool,
+    use_gate: bool,
+    fixed_cache_weight: float,
+):
+    """Full-token causal loss for PCAF without materializing dense cache logits.
+
+    The returned target log-probabilities are exact for the mixture
+    distribution. Accuracy is measured from the parametric logits to avoid
+    constructing a dense [B, T, V] cache distribution.
+    """
+    del semantic_buckets
+    x = params["emb"][tokens]
+    for block in params["blocks"]:
+        x = local_block_forward(block, x)
+
+    h = layer_norm(x, params["head_ln_scale"], params["head_ln_bias"])
+    h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
+    param_logits = h @ params["head_w2"] + params["head_b2"]
+    param_log_probs = jax.nn.log_softmax(param_logits, axis=-1)
+    target_param_log_probs = jnp.take_along_axis(
+        param_log_probs, targets[..., None], axis=-1
+    )[..., 0]
+    pred = jnp.argmax(param_logits, axis=-1)
+    acc = jnp.mean((pred == targets).astype(jnp.float32))
+
+    if not use_cache:
+        return target_param_log_probs, acc
+
+    bsz, seq_len = tokens.shape
+    pos = jnp.arange(seq_len, dtype=jnp.int32)
+    causal = pos[None, :] < pos[:, None]  # [query_t, record_i]
+    recency = pos.astype(jnp.float32) / jnp.maximum(float(seq_len - 1), 1.0)
+    value_tokens = jnp.concatenate(
+        [tokens[:, 1:], jnp.zeros((bsz, 1), dtype=tokens.dtype)], axis=1
+    )
+
+    record_keys = l2_normalize(x @ params["wk"])
+    query = l2_normalize(x @ params["wq"])
+
+    semantic_scores = None
+    semantic_top_idx = None
+    semantic_route_scores = None
+    if routing_mode in {"semantic_hash", "hybrid_semantic_hash"}:
+        sem_logits = x @ params["semantic_w"] + params["semantic_b"]
+        temp = max(float(semantic_temperature), 1.0e-4)
+        sem = jax.nn.softmax(sem_logits / temp, axis=-1)
+        semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem)
+        semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
+        semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
+        _, semantic_top_idx = lax.top_k(semantic_rank_scores, top_k)
+        semantic_route_scores = jnp.take_along_axis(
+            semantic_scores, semantic_top_idx, axis=2
+        )
+
+    if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
+        context_hashes = causal_ngram_hash(tokens, context_order)
+        buckets = bucket_hash(context_hashes, num_buckets)
+        bucket_mask = buckets[:, :, None] == buckets[:, None, :]
+        scores = jnp.einsum("btd,bsd->bts", query, record_keys) * (d_model**-0.5)
+        scores = scores + params["recency_scale"] * recency[None, None, :]
+        mask = bucket_mask & causal[None, :, :]
+        masked_scores = jnp.where(mask, scores, -1.0e9)
+        token_top_scores, token_top_idx = lax.top_k(masked_scores, top_k)
+        token_valid = token_top_scores > -1.0e8
+    else:
+        token_top_idx = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.int32)
+        token_valid = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.bool_)
+
+    if routing_mode == "semantic_hash":
+        top_idx = semantic_top_idx
+        valid = jnp.ones_like(top_idx, dtype=jnp.bool_)
+        candidate_route_scores = semantic_route_scores
+    elif routing_mode == "hybrid_semantic_hash":
+        top_idx = jnp.concatenate([token_top_idx, semantic_top_idx], axis=2)
+        valid = jnp.concatenate(
+            [token_valid, jnp.ones_like(semantic_top_idx, dtype=jnp.bool_)], axis=2
+        )
+        token_route_scores = jnp.take_along_axis(semantic_scores, token_top_idx, axis=2)
+        candidate_route_scores = jnp.concatenate(
+            [token_route_scores, semantic_route_scores], axis=2
+        )
+    else:
+        top_idx = token_top_idx
+        valid = token_valid
+        candidate_route_scores = None
+
+    batch_idx = jnp.arange(bsz)[:, None, None]
+    gathered_keys = record_keys[batch_idx, top_idx]
+    cand_tokens = value_tokens[batch_idx, top_idx]
+
+    cache_scores = jnp.einsum("btkd,btd->btk", gathered_keys, query) * (d_model**-0.5)
+    safe_idx = jnp.maximum(top_idx, 0)
+    cache_scores = cache_scores + params["recency_scale"] * (
+        safe_idx.astype(jnp.float32) / jnp.maximum(float(seq_len - 1), 1.0)
+    )
+    if candidate_route_scores is not None:
+        cache_scores = cache_scores + semantic_score_scale * jnp.log(
+            jnp.maximum(candidate_route_scores, 1.0e-6)
+        )
+    cache_scores = jnp.where(valid, cache_scores, -1.0e9)
+    weights = jax.nn.softmax(cache_scores, axis=2) * valid.astype(jnp.float32)
+    weights = weights / jnp.maximum(jnp.sum(weights, axis=2, keepdims=True), 1.0e-6)
+    target_cache_probs = jnp.sum(
+        weights * (cand_tokens == targets[..., None]).astype(jnp.float32), axis=2
+    )
+
+    if use_gate:
+        g = layer_norm(x, params["gate_ln_scale"], params["gate_ln_bias"])
+        g = jax.nn.gelu(g @ params["gate_w1"] + params["gate_b1"])
+        gate = jax.nn.sigmoid(g @ params["gate_w2"] + params["gate_b2"])[..., 0]
+    else:
+        gate = jnp.full((bsz, seq_len), fixed_cache_weight, dtype=jnp.float32)
+    has_cache = jnp.any(valid, axis=2)
+    gate = gate * has_cache.astype(jnp.float32)
+    gate = jnp.clip(gate, 1.0e-5, 1.0 - 1.0e-5)
+
+    target_param_probs = jnp.exp(target_param_log_probs)
+    target_mix_probs = (1.0 - gate) * target_param_probs + gate * target_cache_probs
+    return jnp.log(jnp.maximum(target_mix_probs, 1.0e-8)), acc
+
+
 def attention_mask(seq_len: int, *, attention_mode: str, window_size: int, global_tokens: int):
     q = jnp.arange(seq_len, dtype=jnp.int32)[:, None]
     k = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
@@ -581,7 +719,62 @@ def transformer_forward(
     return jax.nn.log_softmax(h @ params["head_w2"] + params["head_b2"], axis=-1)
 
 
+def transformer_forward_full_ar(params, tokens, *, heads: int, attention_mode: str, window_size: int, global_tokens: int, linear_chunk_size: int):
+    seq_len = tokens.shape[1]
+    x = params["emb"][tokens] + params["pos"][None, :seq_len, :]
+    for block in params["blocks"]:
+        x = transformer_block_forward(
+            block,
+            x,
+            heads=heads,
+            attention_mode=attention_mode,
+            window_size=window_size,
+            global_tokens=global_tokens,
+            linear_chunk_size=linear_chunk_size,
+        )
+    h = layer_norm(x, params["head_ln_scale"], params["head_ln_bias"])
+    h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
+    return jax.nn.log_softmax(h @ params["head_w2"] + params["head_b2"], axis=-1)
+
+
 def loss_and_metrics(params, tokens, targets, cfg):
+    if cfg["loss_mode"] == "full_ar":
+        if cfg["model_family"] == "transformer":
+            log_probs = transformer_forward_full_ar(
+                params,
+                tokens,
+                heads=cfg["heads"],
+                attention_mode=cfg["attention_mode"],
+                window_size=cfg["attention_window"],
+                global_tokens=cfg["global_tokens"],
+                linear_chunk_size=cfg["linear_chunk_size"],
+            )
+            target_log_probs = jnp.take_along_axis(
+                log_probs, targets[..., None], axis=-1
+            )[..., 0]
+            pred = jnp.argmax(log_probs, axis=-1)
+            acc = jnp.mean((pred == targets).astype(jnp.float32))
+        else:
+            target_log_probs, acc = pcaf_forward_full_ar_target_log_probs(
+                params,
+                tokens,
+                targets,
+                vocab_size=cfg["vocab_size"],
+                d_model=cfg["d_model"],
+                num_buckets=cfg["num_buckets"],
+                top_k=cfg["top_k"],
+                context_order=cfg["context_order"],
+                routing_mode=cfg["routing_mode"],
+                semantic_buckets=cfg["semantic_buckets"],
+                semantic_temperature=cfg["semantic_temperature"],
+                semantic_score_scale=cfg["semantic_score_scale"],
+                use_cache=cfg["use_cache"],
+                use_gate=cfg["use_gate"],
+                fixed_cache_weight=cfg["fixed_cache_weight"],
+            )
+        loss = -jnp.mean(target_log_probs)
+        return loss, {"loss": loss, "acc": acc}
+
     if cfg["model_family"] == "transformer":
         log_probs = transformer_forward(
             params,
@@ -688,6 +881,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-tokens", type=int, default=2_000_000)
     parser.add_argument("--max-eval-tokens", type=int, default=200_000)
     parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument(
+        "--loss-mode",
+        choices=["last_token", "full_ar"],
+        default="last_token",
+        help="last_token predicts one token after each context window; full_ar "
+             "predicts every next token inside the sampled window.",
+    )
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=500)
@@ -754,6 +954,7 @@ def main() -> None:
         per_process_batch=per_process_batch,
         local_device_count=local_device_count,
         seed=args.train_sample_seed + process_index,
+        full_ar=args.loss_mode == "full_ar",
     )
     eval_batcher = HostBatcher(
         eval_ids,
@@ -761,6 +962,7 @@ def main() -> None:
         per_process_batch=per_process_batch,
         local_device_count=local_device_count,
         seed=args.eval_sample_seed + process_index,
+        full_ar=args.loss_mode == "full_ar",
     )
 
     key = random.PRNGKey(args.seed)
@@ -817,6 +1019,7 @@ def main() -> None:
 
     cfg = {
         "model_family": "transformer" if args.model in transformer_models else "pcaf",
+        "loss_mode": args.loss_mode,
         "vocab_size": vocab.size,
         "d_model": args.d_model,
         "num_buckets": args.num_buckets,
@@ -846,6 +1049,7 @@ def main() -> None:
         print(
             f"dataset={args.dataset}/{dataset_config or 'default'} split={eval_split} "
             f"model={args.model} "
+            f"loss_mode={args.loss_mode} "
             f"vocab={vocab.size} train_tokens={len(train_ids):,} "
             f"eval_tokens={len(eval_ids):,} params={n_params:,}"
         )
@@ -902,6 +1106,7 @@ def main() -> None:
                     {
                         "step": step,
                         "model": args.model,
+                        "loss_mode": args.loss_mode,
                         "dataset": args.dataset,
                         "dataset_config": dataset_config or "",
                         "eval_split": eval_split,
