@@ -42,6 +42,74 @@ export GLOBAL_TOKENS="${GLOBAL_TOKENS:-16}"
 PCAF_MODELS="${PCAF_MODELS:-local_conv pcaf_semantic pcaf_context}"
 ATTN_MODELS="${ATTN_MODELS:-transformer_dense local_transformer_w128}"
 
+batch_candidates_from_start() {
+  local start_batch="$1"
+  case "$start_batch" in
+    256) echo "256 128 64 32 16" ;;
+    128) echo "128 64 32 16" ;;
+    64) echo "64 32 16" ;;
+    32) echo "32 16" ;;
+    16) echo "16" ;;
+    *) echo "$start_batch 16" ;;
+  esac
+}
+
+run_with_batch_fallback() {
+  local kind="$1"
+  local name="$2"
+  local dataset_name="$3"
+  local dataset_config="$4"
+  local text_field="$5"
+  local train_tokens="$6"
+  local steps="$7"
+  local eval_every="$8"
+  local lr="$9"
+  local warmup_steps="${10}"
+  local min_lr_ratio="${11}"
+  local weight_decay="${12}"
+  local models="${13}"
+  local batch_var="${14}"
+  local batches="${15}"
+
+  local first=1
+  local batch
+  for batch in $batches; do
+    local log_dir="$BASE_LOG_DIR/${name}_${kind}"
+    if [ "$first" -ne 1 ]; then
+      echo "=== Retrying $kind for $name at global batch $batch ==="
+    fi
+    first=0
+
+    env \
+    LOG_DIR="$log_dir" \
+    DATASET="$dataset_name" \
+    DATASET_CONFIG="$dataset_config" \
+    TEXT_FIELD="$text_field" \
+    MAX_TRAIN_TOKENS="$train_tokens" \
+    STEPS="$steps" \
+    EVAL_EVERY="$eval_every" \
+    EVAL_BATCHES="${EVAL_BATCHES:-100}" \
+    LR="$lr" \
+    WARMUP_STEPS="$warmup_steps" \
+    MIN_LR_RATIO="$min_lr_ratio" \
+    WEIGHT_DECAY="$weight_decay" \
+    RUN_MODELS="$models" \
+    "$batch_var=$batch" \
+    bash "$RUNNER"
+
+    if [ ! -f "$log_dir/status.tsv" ] || ! grep -q "FAIL_" "$log_dir/status.tsv"; then
+      echo "=== $kind for $name succeeded at global batch $batch ==="
+      return 0
+    fi
+
+    echo "=== $kind for $name failed at global batch $batch ==="
+    mv "$log_dir" "$FAILED_LOG_DIR/${name}_${kind}_b${batch}"
+  done
+
+  echo "=== $kind for $name failed for all candidate batches: $batches ==="
+  return 1
+}
+
 run_dataset() {
   local name="$1"
   local dataset_name="$2"
@@ -57,77 +125,19 @@ run_dataset() {
 
   echo "=== 300M DATASET: $name tokens=$train_tokens steps=$steps lr=$lr warmup=$warmup_steps min_lr_ratio=$min_lr_ratio wd=$weight_decay ==="
 
-  LOG_DIR="$BASE_LOG_DIR/${name}_pcaf" \
-  DATASET="$dataset_name" \
-  DATASET_CONFIG="$dataset_config" \
-  TEXT_FIELD="$text_field" \
-  MAX_TRAIN_TOKENS="$train_tokens" \
-  STEPS="$steps" \
-  EVAL_EVERY="$eval_every" \
-  EVAL_BATCHES="${EVAL_BATCHES:-100}" \
-  LR="$lr" \
-  WARMUP_STEPS="$warmup_steps" \
-  MIN_LR_RATIO="$min_lr_ratio" \
-  WEIGHT_DECAY="$weight_decay" \
-  RUN_MODELS="$PCAF_MODELS" \
-  GLOBAL_BATCH_PCAF="${GLOBAL_BATCH_PCAF:-32}" \
-  bash "$RUNNER"
+  local pcaf_start="${GLOBAL_BATCH_PCAF:-32}"
+  local pcaf_batches="${PCAF_BATCH_CANDIDATES:-$(batch_candidates_from_start "$pcaf_start")}"
+  run_with_batch_fallback \
+    pcaf "$name" "$dataset_name" "$dataset_config" "$text_field" \
+    "$train_tokens" "$steps" "$eval_every" "$lr" "$warmup_steps" \
+    "$min_lr_ratio" "$weight_decay" "$PCAF_MODELS" GLOBAL_BATCH_PCAF "$pcaf_batches"
 
-  if [ -f "$BASE_LOG_DIR/${name}_pcaf/status.tsv" ] && grep -q "FAIL_" "$BASE_LOG_DIR/${name}_pcaf/status.tsv"; then
-    echo "=== PCAF batch ${GLOBAL_BATCH_PCAF:-32} failed for $name; retrying PCAF at batch 16 ==="
-    mv "$BASE_LOG_DIR/${name}_pcaf" "$FAILED_LOG_DIR/${name}_pcaf_b${GLOBAL_BATCH_PCAF:-32}"
-    LOG_DIR="$BASE_LOG_DIR/${name}_pcaf" \
-    DATASET="$dataset_name" \
-    DATASET_CONFIG="$dataset_config" \
-    TEXT_FIELD="$text_field" \
-    MAX_TRAIN_TOKENS="$train_tokens" \
-    STEPS="$steps" \
-    EVAL_EVERY="$eval_every" \
-    EVAL_BATCHES="${EVAL_BATCHES:-100}" \
-    LR="$lr" \
-    WARMUP_STEPS="$warmup_steps" \
-    MIN_LR_RATIO="$min_lr_ratio" \
-    WEIGHT_DECAY="$weight_decay" \
-    RUN_MODELS="$PCAF_MODELS" \
-    GLOBAL_BATCH_PCAF=16 \
-    bash "$RUNNER"
-  fi
-
-  LOG_DIR="$BASE_LOG_DIR/${name}_attention" \
-  DATASET="$dataset_name" \
-  DATASET_CONFIG="$dataset_config" \
-  TEXT_FIELD="$text_field" \
-  MAX_TRAIN_TOKENS="$train_tokens" \
-  STEPS="$steps" \
-  EVAL_EVERY="$eval_every" \
-  EVAL_BATCHES="${EVAL_BATCHES:-100}" \
-  LR="$lr" \
-  WARMUP_STEPS="$warmup_steps" \
-  MIN_LR_RATIO="$min_lr_ratio" \
-  WEIGHT_DECAY="$weight_decay" \
-  RUN_MODELS="$ATTN_MODELS" \
-  GLOBAL_BATCH_ATTENTION_2048="${GLOBAL_BATCH_ATTENTION_2048:-32}" \
-  bash "$RUNNER"
-
-  if [ -f "$BASE_LOG_DIR/${name}_attention/status.tsv" ] && grep -q "FAIL_" "$BASE_LOG_DIR/${name}_attention/status.tsv"; then
-    echo "=== Attention batch ${GLOBAL_BATCH_ATTENTION_2048:-32} failed for $name; retrying attention at batch 16 ==="
-    mv "$BASE_LOG_DIR/${name}_attention" "$FAILED_LOG_DIR/${name}_attention_b${GLOBAL_BATCH_ATTENTION_2048:-32}"
-    LOG_DIR="$BASE_LOG_DIR/${name}_attention" \
-    DATASET="$dataset_name" \
-    DATASET_CONFIG="$dataset_config" \
-    TEXT_FIELD="$text_field" \
-    MAX_TRAIN_TOKENS="$train_tokens" \
-    STEPS="$steps" \
-    EVAL_EVERY="$eval_every" \
-    EVAL_BATCHES="${EVAL_BATCHES:-100}" \
-    LR="$lr" \
-    WARMUP_STEPS="$warmup_steps" \
-    MIN_LR_RATIO="$min_lr_ratio" \
-    WEIGHT_DECAY="$weight_decay" \
-    RUN_MODELS="$ATTN_MODELS" \
-    GLOBAL_BATCH_ATTENTION_2048=16 \
-    bash "$RUNNER"
-  fi
+  local attention_start="${GLOBAL_BATCH_ATTENTION_2048:-32}"
+  local attention_batches="${ATTN_BATCH_CANDIDATES:-$(batch_candidates_from_start "$attention_start")}"
+  run_with_batch_fallback \
+    attention "$name" "$dataset_name" "$dataset_config" "$text_field" \
+    "$train_tokens" "$steps" "$eval_every" "$lr" "$warmup_steps" \
+    "$min_lr_ratio" "$weight_decay" "$ATTN_MODELS" GLOBAL_BATCH_ATTENTION_2048 "$attention_batches"
 }
 
 # WikiText-103: 100M tokens, batch 32, seq 2048 => ~1,526 steps/epoch.
@@ -171,4 +181,3 @@ if [ "${JAX_PROCESS_INDEX:-0}" = "0" ]; then
 else
   echo "Worker ${JAX_PROCESS_INDEX:-unknown}: paper tables are produced on process 0."
 fi
-
