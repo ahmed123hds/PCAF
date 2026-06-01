@@ -93,6 +93,7 @@ common_args=(
   --seed "$SEED"
   --train-sample-seed "$TRAIN_SAMPLE_SEED"
   --eval-sample-seed "$EVAL_SAMPLE_SEED"
+  --loss-mode "${LOSS_MODE:-last_token}"
 )
 
 attention_batch_for_seq() {
