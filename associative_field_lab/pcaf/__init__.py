@@ -4,6 +4,7 @@ from .models import (
     SparseAssociativeField,
     SparseAttentionClassifier,
     TransformerClassifier,
+    causal_ngram_hash,
 )
 from .tasks import Batch, TaskInfo, make_batch, task_info
 
@@ -15,6 +16,7 @@ __all__ = [
     "SparseAttentionClassifier",
     "TaskInfo",
     "TransformerClassifier",
+    "causal_ngram_hash",
     "make_batch",
     "task_info",
 ]

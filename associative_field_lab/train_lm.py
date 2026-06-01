@@ -21,12 +21,15 @@ from pcaf import (
     SparseAssociativeField,
     SparseAttentionClassifier,
     TransformerClassifier,
+    causal_ngram_hash,
 )
 
 try:
-    from mamba_ssm import Mamba
+    from mamba_ssm import Mamba, Mamba2, Mamba3
 except Exception:  # pragma: no cover
     Mamba = None
+    Mamba2 = None
+    Mamba3 = None
 
 
 PAD = "<pad>"
@@ -58,6 +61,7 @@ class RandomTokenBatcher:
         batch_size: int,
         device: torch.device,
         seed: int,
+        full_ar: bool = False,
     ):
         if len(ids) <= seq_len + 1:
             raise ValueError("not enough tokens for requested seq_len")
@@ -68,6 +72,7 @@ class RandomTokenBatcher:
         self.aranges = torch.arange(seq_len + 1, device=device)
         self.generator = torch.Generator(device=device)
         self.generator.manual_seed(seed)
+        self.full_ar = full_ar
 
     def sample(self) -> tuple[torch.Tensor, torch.Tensor]:
         starts = torch.randint(
@@ -78,7 +83,9 @@ class RandomTokenBatcher:
             generator=self.generator,
         )
         block = self.data[starts.unsqueeze(1) + self.aranges.unsqueeze(0)]
-        return block[:, :-1], block[:, -1]
+        tokens = block[:, :-1]
+        targets = block[:, 1:] if self.full_ar else block[:, -1]
+        return tokens, targets
 
 
 class MambaClassifier(nn.Module):
@@ -91,18 +98,30 @@ class MambaClassifier(nn.Module):
         num_layers: int,
         d_state: int,
         dropout: float,
+        variant: str = "mamba",
     ) -> None:
         super().__init__()
-        if Mamba is None:
-            raise RuntimeError("mamba_ssm is not installed in this environment")
+        mixer_cls = {
+            "mamba": Mamba,
+            "mamba2": Mamba2,
+            "mamba3": Mamba3,
+        }[variant]
+        if mixer_cls is None:
+            raise RuntimeError(f"{variant} is not installed in this environment")
 
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList(
-            [
+        layers = []
+        for layer_idx in range(num_layers):
+            mixer_kwargs = {"d_model": d_model, "d_state": d_state}
+            if variant == "mamba3":
+                mixer_kwargs.update({"layer_idx": layer_idx, "n_layer": num_layers})
+            else:
+                mixer_kwargs.update({"layer_idx": layer_idx})
+            layers.append(
                 nn.ModuleDict(
                     {
                         "norm1": nn.LayerNorm(d_model),
-                        "mixer": Mamba(d_model=d_model, d_state=d_state),
+                        "mixer": mixer_cls(**mixer_kwargs),
                         "norm2": nn.LayerNorm(d_model),
                         "mlp": nn.Sequential(
                             nn.Linear(d_model, d_hidden),
@@ -112,16 +131,18 @@ class MambaClassifier(nn.Module):
                         ),
                     }
                 )
-                for _ in range(num_layers)
-            ]
-        )
+            )
+        self.layers = nn.ModuleList(layers)
         self.final_norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         x = self.embedding(tokens)
         for layer in self.layers:
-            x = x + layer["mixer"](layer["norm1"](x))
+            mixed = layer["mixer"](layer["norm1"](x))
+            if isinstance(mixed, tuple):
+                mixed = mixed[0]
+            x = x + mixed
             x = x + layer["mlp"](layer["norm2"](x))
         return self.head(self.final_norm(x[:, -1]))
 
@@ -138,6 +159,8 @@ def parse_args() -> argparse.Namespace:
             "local_transformer",
             "global_local_transformer",
             "mamba",
+            "mamba2",
+            "mamba3",
         ],
         default="pcaf",
     )
@@ -150,6 +173,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-tokens", type=int, default=200_000)
 
     parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument(
+        "--loss-mode",
+        choices=["last_token", "full_ar"],
+        default="last_token",
+        help="last_token predicts one token after the sampled window; full_ar "
+             "predicts every next token inside the sampled window.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -306,7 +336,154 @@ def build_model(args: argparse.Namespace, vocab_size: int) -> nn.Module:
         num_layers=args.layers,
         d_state=args.d_state,
         dropout=args.dropout,
+        variant=args.model,
     )
+
+
+def target_log_probs_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    target_logits = logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    return target_logits - torch.logsumexp(logits, dim=-1)
+
+
+def transformer_full_ar_logits(model: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    seq_len = tokens.size(1)
+    if seq_len > model.pos_emb.size(0):
+        raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={model.pos_emb.size(0)}")
+
+    x = model.token_emb(tokens) + model.pos_emb[:seq_len].to(tokens.device)
+    causal_mask = torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=tokens.device),
+        diagonal=1,
+    )
+    encoded = model.encoder(x, mask=causal_mask)
+    return model.head(encoded)
+
+
+def pcaf_context_full_ar_target_log_probs(
+    model: ContextAssociativeLM,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = model.token_emb(tokens)
+    for block in model.local_blocks:
+        x = block(x)
+
+    states = x
+    param_logits = model.param_head(states)
+    target_param_log_probs = target_log_probs_from_logits(param_logits, targets)
+    pred = param_logits.argmax(dim=-1)
+    acc = (pred == targets).float().mean()
+    if not model.use_cache:
+        return target_param_log_probs, acc
+
+    batch, seq_len = tokens.shape
+    value_tokens = torch.cat(
+        [tokens[:, 1:], torch.zeros(batch, 1, dtype=tokens.dtype, device=tokens.device)],
+        dim=1,
+    )
+    record_keys = F.normalize(model.key_proj(states), dim=-1)
+    query = F.normalize(model.query_proj(states), dim=-1)
+    pos = torch.arange(seq_len, device=tokens.device)
+    causal = pos.unsqueeze(0) < pos.unsqueeze(1)
+    recency = pos.float() / max(float(seq_len - 1), 1.0)
+
+    semantic_scores = None
+    semantic_idx = None
+    semantic_route_scores = None
+    if model.candidate_mode in {"semantic_hash", "hybrid_semantic_hash"}:
+        semantic_logits = model.semantic_router(states)
+        temperature = max(float(model.semantic_temperature), 1.0e-4)
+        semantic_probs = torch.softmax(semantic_logits / temperature, dim=-1)
+        semantic_scores = torch.einsum("btc,bsc->bts", semantic_probs, semantic_probs)
+        route_scores = semantic_scores + 1.0e-4 * model.recency_scale * recency.view(1, 1, -1)
+        route_scores = route_scores.masked_fill(~causal.view(1, seq_len, seq_len), -1.0e9)
+        k = seq_len if model.top_k <= 0 else min(model.top_k, seq_len)
+        _, semantic_idx = route_scores.topk(k, dim=2)
+        semantic_route_scores = semantic_scores.gather(dim=2, index=semantic_idx)
+
+    if model.candidate_mode in {"hash", "triton_hash", "oracle", "full", "hybrid_semantic_hash"}:
+        context_hashes = causal_ngram_hash(tokens, model.context_order)
+        if model.candidate_mode == "oracle":
+            candidate_mask = context_hashes[:, :, None] == context_hashes[:, None, :]
+        elif model.candidate_mode == "full":
+            candidate_mask = torch.ones(batch, seq_len, seq_len, dtype=torch.bool, device=tokens.device)
+        else:
+            buckets = torch.remainder(context_hashes.long() * 1_000_003 + 97_531, model.num_buckets)
+            candidate_mask = buckets[:, :, None] == buckets[:, None, :]
+        candidate_mask = candidate_mask & causal.view(1, seq_len, seq_len)
+        scores = torch.einsum("btd,bsd->bts", query, record_keys) * model.scale
+        scores = scores + model.recency_scale * recency.view(1, 1, -1)
+        scores = scores.masked_fill(~candidate_mask, -1.0e9)
+        k = seq_len if model.top_k <= 0 else min(model.top_k, seq_len)
+        top_scores, token_idx = scores.topk(k, dim=2)
+        token_valid = top_scores > -1.0e8
+    else:
+        token_idx = torch.zeros(batch, seq_len, model.top_k, dtype=torch.long, device=tokens.device)
+        token_valid = torch.zeros_like(token_idx, dtype=torch.bool)
+
+    if model.candidate_mode == "semantic_hash":
+        candidate_idx = semantic_idx
+        valid = torch.ones_like(candidate_idx, dtype=torch.bool)
+        candidate_route_scores = semantic_route_scores
+    elif model.candidate_mode == "hybrid_semantic_hash":
+        token_route_scores = semantic_scores.gather(dim=2, index=token_idx)
+        candidate_idx = torch.cat([token_idx, semantic_idx], dim=2)
+        valid = torch.cat([token_valid, torch.ones_like(semantic_idx, dtype=torch.bool)], dim=2)
+        candidate_route_scores = torch.cat([token_route_scores, semantic_route_scores], dim=2)
+    else:
+        candidate_idx = token_idx
+        valid = token_valid
+        candidate_route_scores = None
+
+    safe_idx = candidate_idx.clamp_min(0)
+    gather_key_idx = safe_idx.unsqueeze(-1).expand(-1, -1, -1, record_keys.size(-1))
+    cand_keys = record_keys.unsqueeze(1).expand(-1, seq_len, -1, -1).gather(
+        dim=2, index=gather_key_idx
+    )
+    cand_tokens = value_tokens.unsqueeze(1).expand(-1, seq_len, -1).gather(
+        dim=2, index=safe_idx
+    )
+
+    cache_scores = torch.einsum("btkd,btd->btk", cand_keys, query) * model.scale
+    cache_scores = cache_scores + model.recency_scale * (
+        safe_idx.float() / max(float(seq_len - 1), 1.0)
+    )
+    if candidate_route_scores is not None:
+        cache_scores = cache_scores + model.semantic_score_scale * torch.log(
+            candidate_route_scores.clamp_min(1.0e-6)
+        )
+    cache_scores = cache_scores.masked_fill(~valid, -1.0e9)
+    weights = torch.softmax(cache_scores, dim=2) * valid.float()
+    weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1.0e-6)
+    target_cache_probs = (
+        weights * (cand_tokens == targets.unsqueeze(-1)).float()
+    ).sum(dim=2)
+
+    if model.use_gate:
+        gate = torch.sigmoid(model.gate(states)).squeeze(-1)
+    else:
+        gate = torch.full_like(target_cache_probs, model.fixed_cache_weight)
+    has_cache = valid.any(dim=2)
+    gate = (gate * has_cache.float()).clamp(1.0e-5, 1.0 - 1.0e-5)
+    target_mix_probs = (
+        (1.0 - gate) * target_param_log_probs.exp() + gate * target_cache_probs
+    )
+    return torch.log(target_mix_probs.clamp_min(1.0e-8)), acc
+
+
+def full_ar_loss_and_acc(model: nn.Module, tokens: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(model, ContextAssociativeLM):
+        target_log_probs, acc = pcaf_context_full_ar_target_log_probs(model, tokens, targets)
+        return -target_log_probs.mean(), acc
+    if isinstance(model, TransformerClassifier):
+        logits = transformer_full_ar_logits(model, tokens)
+        loss = -target_log_probs_from_logits(logits, targets).mean()
+        acc = (logits.argmax(dim=-1) == targets).float().mean()
+        return loss, acc
+    logits = model(tokens)
+    loss = F.cross_entropy(logits, targets[:, -1])
+    acc = (logits.argmax(dim=-1) == targets[:, -1]).float().mean()
+    return loss, acc
 
 
 def append_jsonl(path: str, row: dict) -> None:
@@ -319,19 +496,24 @@ def append_jsonl(path: str, row: dict) -> None:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, batcher: RandomTokenBatcher, *, batches: int) -> tuple[float, float]:
+def evaluate(model: nn.Module, batcher: RandomTokenBatcher, *, batches: int, loss_mode: str) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
-    total_correct = 0
+    total_acc = 0.0
     total = 0
     for _ in range(batches):
         tokens, targets = batcher.sample()
-        logits = model(tokens)
-        loss = F.cross_entropy(logits, targets)
-        total_loss += float(loss.item()) * targets.numel()
-        total_correct += int((logits.argmax(dim=-1) == targets).sum().item())
-        total += targets.numel()
-    return total_loss / total, total_correct / total
+        if loss_mode == "full_ar":
+            loss, acc = full_ar_loss_and_acc(model, tokens, targets)
+        else:
+            logits = model(tokens)
+            loss = F.cross_entropy(logits, targets)
+            acc = (logits.argmax(dim=-1) == targets).float().mean()
+        weight = targets.numel() if loss_mode == "full_ar" else targets.size(0)
+        total_loss += float(loss.item()) * weight
+        total_acc += float(acc.item()) * weight
+        total += weight
+    return total_loss / total, total_acc / total
 
 
 def main() -> None:
@@ -354,6 +536,7 @@ def main() -> None:
         batch_size=args.batch_size,
         device=device,
         seed=args.train_sample_seed,
+        full_ar=args.loss_mode == "full_ar",
     )
     eval_batcher = RandomTokenBatcher(
         eval_ids,
@@ -361,6 +544,7 @@ def main() -> None:
         batch_size=args.batch_size,
         device=device,
         seed=args.eval_sample_seed,
+        full_ar=args.loss_mode == "full_ar",
     )
 
     model = build_model(args, vocab.size).to(device)
@@ -373,7 +557,7 @@ def main() -> None:
 
     print(
         f"dataset={args.dataset}/{args.dataset_config} split={eval_split} "
-        f"model={args.model} device={device}"
+        f"model={args.model} loss_mode={args.loss_mode} device={device}"
     )
     print(
         f"vocab={vocab.size} train_tokens={len(train_ids):,} "
@@ -386,8 +570,13 @@ def main() -> None:
         step_start = time.perf_counter()
         model.train()
         tokens, targets = train_batcher.sample()
-        logits = model(tokens)
-        loss = F.cross_entropy(logits, targets)
+        if args.loss_mode == "full_ar":
+            loss, train_acc_tensor = full_ar_loss_and_acc(model, tokens, targets)
+            train_acc_value = float(train_acc_tensor.detach().item())
+        else:
+            logits = model(tokens)
+            loss = F.cross_entropy(logits, targets)
+            train_acc_value = float((logits.argmax(dim=-1) == targets).float().mean().item())
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -400,9 +589,8 @@ def main() -> None:
 
         if step == 1 or step % args.eval_every == 0:
             eval_start = time.perf_counter()
-            train_acc = float((logits.argmax(dim=-1) == targets).float().mean().item())
             eval_loss, eval_acc = evaluate(
-                model, eval_batcher, batches=args.eval_batches
+                model, eval_batcher, batches=args.eval_batches, loss_mode=args.loss_mode
             )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -427,7 +615,7 @@ def main() -> None:
             )
             ppl = math.exp(min(20.0, eval_loss))
             print(
-                f"step={step:05d} loss={loss.item():.4f} train_acc={train_acc:.4f} "
+                f"step={step:05d} loss={loss.item():.4f} train_acc={train_acc_value:.4f} "
                 f"eval_loss={eval_loss:.4f} eval_ppl={ppl:.2f} eval_acc={eval_acc:.4f} "
                 f"train_step_sec={train_step_sec:.4f} tok_per_sec={train_tokens_per_sec:.1f} "
                 f"eval_sec={eval_elapsed:.2f} elapsed_min={total_elapsed / 60.0:.2f} "
@@ -438,9 +626,10 @@ def main() -> None:
                 {
                     "step": step,
                     "model": args.model,
+                    "loss_mode": args.loss_mode,
                     "params": n_params,
                     "train_loss": float(loss.item()),
-                    "train_acc": train_acc,
+                    "train_acc": train_acc_value,
                     "eval_loss": eval_loss,
                     "eval_ppl": ppl,
                     "eval_acc": eval_acc,
