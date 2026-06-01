@@ -314,6 +314,17 @@ def l2_normalize(x, eps: float = 1.0e-6):
     return x * lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + eps)
 
 
+def target_log_probs_from_logits(logits, targets):
+    """Gather exact target log-probs without materializing full log-softmax."""
+    target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    max_logits = jnp.max(logits, axis=-1)
+    log_norm = (
+        jnp.log(jnp.sum(jnp.exp(logits - max_logits[..., None]), axis=-1))
+        + max_logits
+    )
+    return target_logits - log_norm
+
+
 def causal_ngram_hash(tokens, order: int):
     h = jnp.zeros_like(tokens, dtype=jnp.int32)
     for shift in range(order - 1, -1, -1):
@@ -482,10 +493,7 @@ def pcaf_forward_full_ar_target_log_probs(
     h = layer_norm(x, params["head_ln_scale"], params["head_ln_bias"])
     h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
     param_logits = h @ params["head_w2"] + params["head_b2"]
-    param_log_probs = jax.nn.log_softmax(param_logits, axis=-1)
-    target_param_log_probs = jnp.take_along_axis(
-        param_log_probs, targets[..., None], axis=-1
-    )[..., 0]
+    target_param_log_probs = target_log_probs_from_logits(param_logits, targets)
     pred = jnp.argmax(param_logits, axis=-1)
     acc = jnp.mean((pred == targets).astype(jnp.float32))
 
@@ -734,13 +742,13 @@ def transformer_forward_full_ar(params, tokens, *, heads: int, attention_mode: s
         )
     h = layer_norm(x, params["head_ln_scale"], params["head_ln_bias"])
     h = jax.nn.gelu(h @ params["head_w1"] + params["head_b1"])
-    return jax.nn.log_softmax(h @ params["head_w2"] + params["head_b2"], axis=-1)
+    return h @ params["head_w2"] + params["head_b2"]
 
 
 def loss_and_metrics(params, tokens, targets, cfg):
     if cfg["loss_mode"] == "full_ar":
         if cfg["model_family"] == "transformer":
-            log_probs = transformer_forward_full_ar(
+            logits = transformer_forward_full_ar(
                 params,
                 tokens,
                 heads=cfg["heads"],
@@ -749,10 +757,8 @@ def loss_and_metrics(params, tokens, targets, cfg):
                 global_tokens=cfg["global_tokens"],
                 linear_chunk_size=cfg["linear_chunk_size"],
             )
-            target_log_probs = jnp.take_along_axis(
-                log_probs, targets[..., None], axis=-1
-            )[..., 0]
-            pred = jnp.argmax(log_probs, axis=-1)
+            target_log_probs = target_log_probs_from_logits(logits, targets)
+            pred = jnp.argmax(logits, axis=-1)
             acc = jnp.mean((pred == targets).astype(jnp.float32))
         else:
             target_log_probs, acc = pcaf_forward_full_ar_target_log_probs(
