@@ -37,6 +37,8 @@ PCAF_LOCAL_KERNEL_SIZE="${PCAF_LOCAL_KERNEL_SIZE:-5}"
 SEMANTIC_BUCKETS="${SEMANTIC_BUCKETS:-256}"
 SEMANTIC_TEMPERATURE="${SEMANTIC_TEMPERATURE:-0.2}"
 SEMANTIC_SCORE_SCALE="${SEMANTIC_SCORE_SCALE:-0.5}"
+SEMANTIC_CANDIDATE_MODE="${SEMANTIC_CANDIDATE_MODE:-dense}"
+SEMANTIC_QUERY_BUCKETS="${SEMANTIC_QUERY_BUCKETS:-1}"
 ROUTE_TOP_K="${ROUTE_TOP_K:-exact}"
 APPROX_RECALL_TARGET="${APPROX_RECALL_TARGET:-0.95}"
 CACHE_DTYPE="${CACHE_DTYPE:-float32}"
@@ -104,6 +106,8 @@ run_one() {
       --semantic-buckets "$SEMANTIC_BUCKETS" \
       --semantic-temperature "$SEMANTIC_TEMPERATURE" \
       --semantic-score-scale "$SEMANTIC_SCORE_SCALE" \
+      --semantic-candidate-mode "$SEMANTIC_CANDIDATE_MODE" \
+      --semantic-query-buckets "$SEMANTIC_QUERY_BUCKETS" \
       --route-top-k "$ROUTE_TOP_K" \
       --approx-recall-target "$APPROX_RECALL_TARGET" \
       --cache-dtype "$CACHE_DTYPE" \
