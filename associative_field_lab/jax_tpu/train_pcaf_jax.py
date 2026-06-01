@@ -342,24 +342,6 @@ def bucket_hash(values, num_buckets: int):
     return jnp.mod(values.astype(jnp.int32) * jnp.asarray(1_000_003, jnp.int32) + 97_531, num_buckets)
 
 
-def cache_compute_cast(x, cache_dtype: str):
-    if cache_dtype == "bfloat16":
-        return x.astype(jnp.bfloat16)
-    return x
-
-
-def route_top_k(scores, k: int, *, route_top_k_mode: str, approx_recall_target: float):
-    if route_top_k_mode == "approx":
-        return lax.approx_max_k(
-            scores,
-            k=k,
-            reduction_dimension=-1,
-            recall_target=approx_recall_target,
-            aggregate_to_topk=True,
-        )
-    return lax.top_k(scores, k)
-
-
 def pcaf_forward(
     params,
     tokens,
@@ -376,9 +358,6 @@ def pcaf_forward(
     use_cache: bool,
     use_gate: bool,
     fixed_cache_weight: float,
-    route_top_k_mode: str,
-    approx_recall_target: float,
-    cache_dtype: str,
 ):
     x = params["emb"][tokens]
     for block in params["blocks"]:
@@ -394,8 +373,8 @@ def pcaf_forward(
 
     value_tokens = tokens[:, 1:]
 
-    record_keys = cache_compute_cast(l2_normalize(x[:, :-1, :] @ params["wk"]), cache_dtype)
-    query = cache_compute_cast(l2_normalize(final_state @ params["wq"]), cache_dtype)
+    record_keys = l2_normalize(x[:, :-1, :] @ params["wk"])
+    query = l2_normalize(final_state @ params["wq"])
     n_records = value_tokens.shape[1]
     recency = jnp.linspace(0.0, 1.0, n_records, dtype=jnp.float32)
 
@@ -406,16 +385,9 @@ def pcaf_forward(
         temp = max(float(semantic_temperature), 1.0e-4)
         record_sem = jax.nn.softmax(record_sem_logits / temp, axis=-1)
         query_sem = jax.nn.softmax(query_sem_logits / temp, axis=-1)
-        record_sem = cache_compute_cast(record_sem, cache_dtype)
-        query_sem = cache_compute_cast(query_sem, cache_dtype)
-        semantic_scores = jnp.einsum("bnc,bc->bn", record_sem, query_sem).astype(jnp.float32)
+        semantic_scores = jnp.einsum("bnc,bc->bn", record_sem, query_sem)
         semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, :]
-        semantic_top_scores, semantic_top_idx = route_top_k(
-            semantic_rank_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
+        semantic_top_scores, semantic_top_idx = lax.top_k(semantic_rank_scores, top_k)
         semantic_route_scores = jnp.take_along_axis(
             semantic_scores, semantic_top_idx, axis=1
         )
@@ -424,18 +396,13 @@ def pcaf_forward(
         context_hashes = causal_ngram_hash(tokens, context_order)
         record_hashes = context_hashes[:, :-1]
         query_hashes = context_hashes[:, -1]
-        scores = jnp.einsum("bnd,bd->bn", record_keys, query).astype(jnp.float32) * (d_model**-0.5)
+        scores = jnp.einsum("bnd,bd->bn", record_keys, query) * (d_model**-0.5)
         scores = scores + params["recency_scale"] * recency[None, :]
         record_bucket = bucket_hash(record_hashes, num_buckets)
         query_bucket = bucket_hash(query_hashes, num_buckets)[:, None]
         mask = record_bucket == query_bucket
         masked_scores = jnp.where(mask, scores, -1.0e9)
-        token_top_scores, token_top_idx = route_top_k(
-            masked_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
+        token_top_scores, token_top_idx = lax.top_k(masked_scores, top_k)
         token_valid = token_top_scores > -1.0e8
     else:
         token_top_idx = jnp.zeros((tokens.shape[0], top_k), dtype=jnp.int32)
@@ -463,7 +430,7 @@ def pcaf_forward(
 
     batch_idx = jnp.arange(tokens.shape[0])[:, None]  # [B, 1]
     gathered_keys = record_keys[batch_idx, top_idx]    # [B, K, D]
-    cache_scores = jnp.einsum("bkd,bd->bk", gathered_keys, query).astype(jnp.float32) * (d_model**-0.5)
+    cache_scores = jnp.einsum("bkd,bd->bk", gathered_keys, query) * (d_model**-0.5)
     safe_idx = jnp.maximum(top_idx, 0)
     cache_scores = cache_scores + params["recency_scale"] * (
         safe_idx.astype(jnp.float32) / jnp.maximum(float(n_records - 1), 1.0)
@@ -511,9 +478,6 @@ def pcaf_forward_full_ar_target_log_probs(
     use_cache: bool,
     use_gate: bool,
     fixed_cache_weight: float,
-    route_top_k_mode: str,
-    approx_recall_target: float,
-    cache_dtype: str,
 ):
     """Full-token causal loss for PCAF without materializing dense cache logits.
 
@@ -544,8 +508,8 @@ def pcaf_forward_full_ar_target_log_probs(
         [tokens[:, 1:], jnp.zeros((bsz, 1), dtype=tokens.dtype)], axis=1
     )
 
-    record_keys = cache_compute_cast(l2_normalize(x @ params["wk"]), cache_dtype)
-    query = cache_compute_cast(l2_normalize(x @ params["wq"]), cache_dtype)
+    record_keys = l2_normalize(x @ params["wk"])
+    query = l2_normalize(x @ params["wq"])
 
     semantic_scores = None
     semantic_top_idx = None
@@ -554,16 +518,10 @@ def pcaf_forward_full_ar_target_log_probs(
         sem_logits = x @ params["semantic_w"] + params["semantic_b"]
         temp = max(float(semantic_temperature), 1.0e-4)
         sem = jax.nn.softmax(sem_logits / temp, axis=-1)
-        sem = cache_compute_cast(sem, cache_dtype)
-        semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem).astype(jnp.float32)
+        semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem)
         semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
         semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
-        _, semantic_top_idx = route_top_k(
-            semantic_rank_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
+        _, semantic_top_idx = lax.top_k(semantic_rank_scores, top_k)
         semantic_route_scores = jnp.take_along_axis(
             semantic_scores, semantic_top_idx, axis=2
         )
@@ -572,16 +530,11 @@ def pcaf_forward_full_ar_target_log_probs(
         context_hashes = causal_ngram_hash(tokens, context_order)
         buckets = bucket_hash(context_hashes, num_buckets)
         bucket_mask = buckets[:, :, None] == buckets[:, None, :]
-        scores = jnp.einsum("btd,bsd->bts", query, record_keys).astype(jnp.float32) * (d_model**-0.5)
+        scores = jnp.einsum("btd,bsd->bts", query, record_keys) * (d_model**-0.5)
         scores = scores + params["recency_scale"] * recency[None, None, :]
         mask = bucket_mask & causal[None, :, :]
         masked_scores = jnp.where(mask, scores, -1.0e9)
-        token_top_scores, token_top_idx = route_top_k(
-            masked_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
+        token_top_scores, token_top_idx = lax.top_k(masked_scores, top_k)
         token_valid = token_top_scores > -1.0e8
     else:
         token_top_idx = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.int32)
@@ -609,7 +562,7 @@ def pcaf_forward_full_ar_target_log_probs(
     gathered_keys = record_keys[batch_idx, top_idx]
     cand_tokens = value_tokens[batch_idx, top_idx]
 
-    cache_scores = jnp.einsum("btkd,btd->btk", gathered_keys, query).astype(jnp.float32) * (d_model**-0.5)
+    cache_scores = jnp.einsum("btkd,btd->btk", gathered_keys, query) * (d_model**-0.5)
     safe_idx = jnp.maximum(top_idx, 0)
     cache_scores = cache_scores + params["recency_scale"] * (
         safe_idx.astype(jnp.float32) / jnp.maximum(float(seq_len - 1), 1.0)
@@ -824,9 +777,6 @@ def loss_and_metrics(params, tokens, targets, cfg):
                 use_cache=cfg["use_cache"],
                 use_gate=cfg["use_gate"],
                 fixed_cache_weight=cfg["fixed_cache_weight"],
-                route_top_k_mode=cfg["route_top_k"],
-                approx_recall_target=cfg["approx_recall_target"],
-                cache_dtype=cfg["cache_dtype"],
             )
         loss = -jnp.mean(target_log_probs)
         return loss, {"loss": loss, "acc": acc}
@@ -857,9 +807,6 @@ def loss_and_metrics(params, tokens, targets, cfg):
             use_cache=cfg["use_cache"],
             use_gate=cfg["use_gate"],
             fixed_cache_weight=cfg["fixed_cache_weight"],
-            route_top_k_mode=cfg["route_top_k"],
-            approx_recall_target=cfg["approx_recall_target"],
-            cache_dtype=cfg["cache_dtype"],
         )
     target_log_probs = jnp.take_along_axis(log_probs, targets[:, None], axis=1)[:, 0]
     loss = -jnp.mean(target_log_probs)
@@ -976,19 +923,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-buckets", type=int, default=256)
     parser.add_argument("--semantic-temperature", type=float, default=0.2)
     parser.add_argument("--semantic-score-scale", type=float, default=1.0)
-    parser.add_argument(
-        "--route-top-k",
-        choices=["exact", "approx"],
-        default="exact",
-        help="Use exact lax.top_k or TPU-optimized approximate top-k for cache routing.",
-    )
-    parser.add_argument("--approx-recall-target", type=float, default=0.95)
-    parser.add_argument(
-        "--cache-dtype",
-        choices=["float32", "bfloat16"],
-        default="float32",
-        help="Compute cache-routing dot products in this dtype; logits/loss stay float32.",
-    )
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-gate", action="store_true")
     parser.add_argument("--fixed-cache-weight", type=float, default=0.5)
@@ -998,8 +932,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.route_top_k == "approx" and not hasattr(lax, "approx_max_k"):
-        raise RuntimeError("this JAX version does not provide lax.approx_max_k")
     if args.jax_distributed:
         jax.distributed.initialize()
 
@@ -1103,9 +1035,6 @@ def main() -> None:
         "semantic_buckets": args.semantic_buckets,
         "semantic_temperature": args.semantic_temperature,
         "semantic_score_scale": args.semantic_score_scale,
-        "route_top_k": args.route_top_k,
-        "approx_recall_target": args.approx_recall_target,
-        "cache_dtype": args.cache_dtype,
         "use_cache": use_cache,
         "use_gate": use_gate,
         "fixed_cache_weight": args.fixed_cache_weight,
@@ -1134,11 +1063,6 @@ def main() -> None:
             f"seq_len={args.seq_len} global_batch={args.global_batch_size} "
             f"per_process_batch={per_process_batch} "
             f"per_device_batch={train_batcher.per_device_batch}"
-        )
-        print(
-            f"route_top_k={args.route_top_k} "
-            f"approx_recall_target={args.approx_recall_target} "
-            f"cache_dtype={args.cache_dtype}"
         )
 
     run_start = time.perf_counter()
@@ -1235,9 +1159,6 @@ def main() -> None:
                         "semantic_buckets": args.semantic_buckets,
                         "semantic_temperature": args.semantic_temperature,
                         "semantic_score_scale": args.semantic_score_scale,
-                        "route_top_k": args.route_top_k,
-                        "approx_recall_target": args.approx_recall_target,
-                        "cache_dtype": args.cache_dtype,
                         "use_cache": use_cache,
                         "use_gate": use_gate,
                     },

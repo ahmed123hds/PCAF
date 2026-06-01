@@ -54,9 +54,6 @@ CONTEXT_ORDER="${CONTEXT_ORDER:-1}"
 SEMANTIC_BUCKETS="${SEMANTIC_BUCKETS:-256}"
 SEMANTIC_TEMPERATURE="${SEMANTIC_TEMPERATURE:-0.2}"
 SEMANTIC_SCORE_SCALE="${SEMANTIC_SCORE_SCALE:-0.5}"
-ROUTE_TOP_K="${ROUTE_TOP_K:-exact}"
-APPROX_RECALL_TARGET="${APPROX_RECALL_TARGET:-0.95}"
-CACHE_DTYPE="${CACHE_DTYPE:-float32}"
 
 ATTN_D_MODEL="${ATTN_D_MODEL:-192}"
 ATTN_D_HIDDEN="${ATTN_D_HIDDEN:-1024}"
@@ -99,9 +96,6 @@ common_args=(
   --train-sample-seed "$TRAIN_SAMPLE_SEED"
   --eval-sample-seed "$EVAL_SAMPLE_SEED"
   --loss-mode "${LOSS_MODE:-last_token}"
-  --route-top-k "$ROUTE_TOP_K"
-  --approx-recall-target "$APPROX_RECALL_TARGET"
-  --cache-dtype "$CACHE_DTYPE"
 )
 
 attention_batch_for_seq() {
