@@ -549,6 +549,7 @@ def pcaf_forward_full_ar_target_log_probs(
 
     semantic_scores = None
     semantic_top_idx = None
+    semantic_valid = None
     semantic_route_scores = None
     if routing_mode in {"semantic_hash", "hybrid_semantic_hash"}:
         sem_logits = x @ params["semantic_w"] + params["semantic_b"]
@@ -558,12 +559,13 @@ def pcaf_forward_full_ar_target_log_probs(
         semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem).astype(jnp.float32)
         semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
         semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
-        _, semantic_top_idx = route_top_k(
+        semantic_top_scores, semantic_top_idx = route_top_k(
             semantic_rank_scores,
             top_k,
             route_top_k_mode=route_top_k_mode,
             approx_recall_target=approx_recall_target,
         )
+        semantic_valid = semantic_top_scores > -1.0e8
         semantic_route_scores = jnp.take_along_axis(
             semantic_scores, semantic_top_idx, axis=2
         )
@@ -589,12 +591,12 @@ def pcaf_forward_full_ar_target_log_probs(
 
     if routing_mode == "semantic_hash":
         top_idx = semantic_top_idx
-        valid = jnp.ones_like(top_idx, dtype=jnp.bool_)
+        valid = semantic_valid
         candidate_route_scores = semantic_route_scores
     elif routing_mode == "hybrid_semantic_hash":
         top_idx = jnp.concatenate([token_top_idx, semantic_top_idx], axis=2)
         valid = jnp.concatenate(
-            [token_valid, jnp.ones_like(semantic_top_idx, dtype=jnp.bool_)], axis=2
+            [token_valid, semantic_valid], axis=2
         )
         token_route_scores = jnp.take_along_axis(semantic_scores, token_top_idx, axis=2)
         candidate_route_scores = jnp.concatenate(
