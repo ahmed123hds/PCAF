@@ -31,9 +31,9 @@ run_one() {
     --steps 5000 \
     --eval-every 500 \
     --eval-batches 50 \
-    --d-model 256 \
-    --d-hidden 1000 \
-    --local-layers 2 \
+    --d-model 224 \
+    --d-hidden 896 \
+    --local-layers 14 \
     --local-kernel-size 5 \
     --num-buckets 32768 \
     --top-k 16 \

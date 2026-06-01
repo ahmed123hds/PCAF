@@ -25,9 +25,9 @@ ROUTING_MODE="${ROUTING_MODE:-token_hash}"
   --steps "$STEPS" \
   --eval-every "$EVAL_EVERY" \
   --eval-batches "$EVAL_BATCHES" \
-  --d-model 256 \
-  --d-hidden 1000 \
-  --local-layers 2 \
+  --d-model 224 \
+  --d-hidden 896 \
+  --local-layers 14 \
   --local-kernel-size 5 \
   --num-buckets 32768 \
   --top-k 16 \
