@@ -403,6 +403,36 @@ def previous_indices_for_query_buckets(
     )
 
 
+def previous_indices_by_sorted_bucket(buckets, *, top_k: int):
+    """Return previous same-bucket positions using a sorted inverted index.
+
+    Unlike the dense prefix table used for small learned semantic buckets, this
+    keeps memory O(B*T). It is suitable for large token-hash tables such as
+    32768 buckets.
+    """
+    bsz, seq_len = buckets.shape
+    pos = jnp.arange(seq_len, dtype=jnp.int32)
+    sort_key = buckets.astype(jnp.int32) * jnp.asarray(seq_len + 1, jnp.int32) + pos[None, :]
+    sorted_pos = jnp.argsort(sort_key, axis=1, stable=True).astype(jnp.int32)
+    batch_idx_2d = jnp.arange(bsz)[:, None]
+    sorted_bucket = buckets[batch_idx_2d, sorted_pos]
+    sorted_rank = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    rank_by_pos = jnp.zeros((bsz, seq_len), dtype=jnp.int32)
+    rank_by_pos = rank_by_pos.at[batch_idx_2d, sorted_pos].set(sorted_rank)
+
+    offsets = jnp.arange(1, top_k + 1, dtype=jnp.int32)
+    candidate_rank = rank_by_pos[..., None] - offsets
+    valid = candidate_rank >= 0
+    safe_rank = jnp.maximum(candidate_rank, 0)
+    batch_idx_3d = jnp.arange(bsz)[:, None, None]
+    candidate_idx = sorted_pos[batch_idx_3d, safe_rank]
+    candidate_bucket = sorted_bucket[batch_idx_3d, safe_rank]
+    query_bucket = buckets[..., None]
+    valid = valid & (candidate_bucket == query_bucket) & (candidate_idx < pos[None, :, None])
+    candidate_idx = jnp.where(valid, candidate_idx, -1)
+    return candidate_idx, valid
+
+
 def semantic_bucket_candidates(
     semantic_logits,
     *,
@@ -442,6 +472,7 @@ def pcaf_forward(
     semantic_buckets: int,
     semantic_temperature: float,
     semantic_score_scale: float,
+    token_candidate_mode: str,
     semantic_candidate_mode: str,
     semantic_query_buckets: int,
     use_cache: bool,
@@ -506,21 +537,30 @@ def pcaf_forward(
 
     if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, context_order)
-        record_hashes = context_hashes[:, :-1]
-        query_hashes = context_hashes[:, -1]
-        scores = jnp.einsum("bnd,bd->bn", record_keys, query).astype(jnp.float32) * (d_model**-0.5)
-        scores = scores + params["recency_scale"] * recency[None, :]
-        record_bucket = bucket_hash(record_hashes, num_buckets)
-        query_bucket = bucket_hash(query_hashes, num_buckets)[:, None]
-        mask = record_bucket == query_bucket
-        masked_scores = jnp.where(mask, scores, -1.0e9)
-        token_top_scores, token_top_idx = route_top_k(
-            masked_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
-        token_valid = token_top_scores > -1.0e8
+        all_buckets = bucket_hash(context_hashes, num_buckets)
+        if token_candidate_mode == "bucket":
+            token_top_full, token_valid_full = previous_indices_by_sorted_bucket(
+                all_buckets,
+                top_k=top_k,
+            )
+            token_top_idx = token_top_full[:, -1, :]
+            token_valid = token_valid_full[:, -1, :]
+        else:
+            record_hashes = context_hashes[:, :-1]
+            query_hashes = context_hashes[:, -1]
+            scores = jnp.einsum("bnd,bd->bn", record_keys, query).astype(jnp.float32) * (d_model**-0.5)
+            scores = scores + params["recency_scale"] * recency[None, :]
+            record_bucket = bucket_hash(record_hashes, num_buckets)
+            query_bucket = bucket_hash(query_hashes, num_buckets)[:, None]
+            mask = record_bucket == query_bucket
+            masked_scores = jnp.where(mask, scores, -1.0e9)
+            token_top_scores, token_top_idx = route_top_k(
+                masked_scores,
+                top_k,
+                route_top_k_mode=route_top_k_mode,
+                approx_recall_target=approx_recall_target,
+            )
+            token_valid = token_top_scores > -1.0e8
     else:
         token_top_idx = jnp.zeros((tokens.shape[0], top_k), dtype=jnp.int32)
         token_valid = jnp.zeros((tokens.shape[0], top_k), dtype=jnp.bool_)
@@ -592,6 +632,7 @@ def pcaf_forward_full_ar_target_log_probs(
     semantic_buckets: int,
     semantic_temperature: float,
     semantic_score_scale: float,
+    token_candidate_mode: str,
     semantic_candidate_mode: str,
     semantic_query_buckets: int,
     use_cache: bool,
@@ -667,18 +708,24 @@ def pcaf_forward_full_ar_target_log_probs(
     if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, context_order)
         buckets = bucket_hash(context_hashes, num_buckets)
-        bucket_mask = buckets[:, :, None] == buckets[:, None, :]
-        scores = jnp.einsum("btd,bsd->bts", query, record_keys).astype(jnp.float32) * (d_model**-0.5)
-        scores = scores + params["recency_scale"] * recency[None, None, :]
-        mask = bucket_mask & causal[None, :, :]
-        masked_scores = jnp.where(mask, scores, -1.0e9)
-        token_top_scores, token_top_idx = route_top_k(
-            masked_scores,
-            top_k,
-            route_top_k_mode=route_top_k_mode,
-            approx_recall_target=approx_recall_target,
-        )
-        token_valid = token_top_scores > -1.0e8
+        if token_candidate_mode == "bucket":
+            token_top_idx, token_valid = previous_indices_by_sorted_bucket(
+                buckets,
+                top_k=top_k,
+            )
+        else:
+            bucket_mask = buckets[:, :, None] == buckets[:, None, :]
+            scores = jnp.einsum("btd,bsd->bts", query, record_keys).astype(jnp.float32) * (d_model**-0.5)
+            scores = scores + params["recency_scale"] * recency[None, None, :]
+            mask = bucket_mask & causal[None, :, :]
+            masked_scores = jnp.where(mask, scores, -1.0e9)
+            token_top_scores, token_top_idx = route_top_k(
+                masked_scores,
+                top_k,
+                route_top_k_mode=route_top_k_mode,
+                approx_recall_target=approx_recall_target,
+            )
+            token_valid = token_top_scores > -1.0e8
     else:
         token_top_idx = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.int32)
         token_valid = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.bool_)
@@ -917,6 +964,7 @@ def loss_and_metrics(params, tokens, targets, cfg):
                 semantic_buckets=cfg["semantic_buckets"],
                 semantic_temperature=cfg["semantic_temperature"],
                 semantic_score_scale=cfg["semantic_score_scale"],
+                token_candidate_mode=cfg["token_candidate_mode"],
                 semantic_candidate_mode=cfg["semantic_candidate_mode"],
                 semantic_query_buckets=cfg["semantic_query_buckets"],
                 use_cache=cfg["use_cache"],
@@ -952,6 +1000,7 @@ def loss_and_metrics(params, tokens, targets, cfg):
             semantic_buckets=cfg["semantic_buckets"],
             semantic_temperature=cfg["semantic_temperature"],
             semantic_score_scale=cfg["semantic_score_scale"],
+            token_candidate_mode=cfg["token_candidate_mode"],
             semantic_candidate_mode=cfg["semantic_candidate_mode"],
             semantic_query_buckets=cfg["semantic_query_buckets"],
             use_cache=cfg["use_cache"],
@@ -1076,6 +1125,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-buckets", type=int, default=256)
     parser.add_argument("--semantic-temperature", type=float, default=0.2)
     parser.add_argument("--semantic-score-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--token-candidate-mode",
+        choices=["dense", "bucket"],
+        default="dense",
+        help="dense scores all same-bucket records; bucket retrieves recent records by parallel prefix index.",
+    )
     parser.add_argument(
         "--semantic-candidate-mode",
         choices=["dense", "bucket"],
@@ -1215,6 +1270,7 @@ def main() -> None:
         "semantic_buckets": args.semantic_buckets,
         "semantic_temperature": args.semantic_temperature,
         "semantic_score_scale": args.semantic_score_scale,
+        "token_candidate_mode": args.token_candidate_mode,
         "semantic_candidate_mode": args.semantic_candidate_mode,
         "semantic_query_buckets": args.semantic_query_buckets,
         "route_top_k": args.route_top_k,
@@ -1253,6 +1309,7 @@ def main() -> None:
             f"route_top_k={args.route_top_k} "
             f"approx_recall_target={args.approx_recall_target} "
             f"cache_dtype={args.cache_dtype} "
+            f"token_candidate_mode={args.token_candidate_mode} "
             f"semantic_candidate_mode={args.semantic_candidate_mode} "
             f"semantic_query_buckets={args.semantic_query_buckets}"
         )
@@ -1351,6 +1408,7 @@ def main() -> None:
                         "semantic_buckets": args.semantic_buckets,
                         "semantic_temperature": args.semantic_temperature,
                         "semantic_score_scale": args.semantic_score_scale,
+                        "token_candidate_mode": args.token_candidate_mode,
                         "semantic_candidate_mode": args.semantic_candidate_mode,
                         "semantic_query_buckets": args.semantic_query_buckets,
                         "route_top_k": args.route_top_k,
