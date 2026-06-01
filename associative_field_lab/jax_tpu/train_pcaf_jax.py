@@ -815,8 +815,26 @@ def loss_and_metrics(params, tokens, targets, cfg):
     return loss, {"loss": loss, "acc": acc}
 
 
-def make_train_step(cfg, lr: float, weight_decay: float):
-    def train_step(params, opt_state, tokens, targets):
+def learning_rate_at_step(
+    step: int,
+    *,
+    base_lr: float,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_lr * step / warmup_steps
+    if total_steps <= warmup_steps:
+        return base_lr
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+
+def make_train_step(cfg, weight_decay: float):
+    def train_step(params, opt_state, tokens, targets, lr):
         (loss, metrics), grads = jax.value_and_grad(loss_and_metrics, has_aux=True)(
             params, tokens, targets, cfg
         )
@@ -825,6 +843,8 @@ def make_train_step(cfg, lr: float, weight_decay: float):
         params, opt_state = adamw_update(
             params, grads, opt_state, lr=lr, weight_decay=weight_decay
         )
+        metrics = dict(metrics)
+        metrics["lr"] = lax.pmean(lr, axis_name="data")
         return params, opt_state, metrics
 
     return jax.pmap(train_step, axis_name="data", donate_argnums=(0, 1))
@@ -899,6 +919,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-batches", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--min-lr-ratio", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--train-sample-seed", type=int, default=10001)
@@ -1044,7 +1066,7 @@ def main() -> None:
         "global_tokens": args.global_tokens,
         "linear_chunk_size": args.linear_chunk_size,
     }
-    train_step = make_train_step(cfg, args.lr, args.weight_decay)
+    train_step = make_train_step(cfg, args.weight_decay)
     eval_step = make_eval_step(cfg)
 
     if process_index == 0:
@@ -1064,13 +1086,27 @@ def main() -> None:
             f"per_process_batch={per_process_batch} "
             f"per_device_batch={train_batcher.per_device_batch}"
         )
+        print(
+            f"lr={args.lr} warmup_steps={args.warmup_steps} "
+            f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay}"
+        )
 
     run_start = time.perf_counter()
     last_log_time = run_start
     last_metrics = None
     for step in range(1, args.steps + 1):
         tokens_np, targets_np = train_batcher.sample()
-        params, opt_state, last_metrics = train_step(params, opt_state, tokens_np, targets_np)
+        lr = learning_rate_at_step(
+            step,
+            base_lr=args.lr,
+            total_steps=args.steps,
+            warmup_steps=args.warmup_steps,
+            min_lr_ratio=args.min_lr_ratio,
+        )
+        lr_shard = np.full((local_device_count,), lr, dtype=np.float32)
+        params, opt_state, last_metrics = train_step(
+            params, opt_state, tokens_np, targets_np, lr_shard
+        )
 
         if step == 1 or step % args.eval_every == 0:
             # Force completion before timing.
@@ -1104,6 +1140,7 @@ def main() -> None:
                 print(
                     f"step={step:05d} loss={train_loss:.4f} train_acc={train_acc:.4f} "
                     f"eval_loss={eval_loss:.4f} eval_ppl={ppl:.2f} eval_acc={eval_acc:.4f} "
+                    f"lr={metric_scalar(last_metrics, 'lr'):.6g} "
                     f"train_step_sec={train_step_sec:.4f} tok_per_sec={tok_per_sec:.1f} "
                     f"eval_sec={eval_sec:.2f} elapsed_min={(now - run_start) / 60.0:.2f}"
                 )
@@ -1129,6 +1166,9 @@ def main() -> None:
                         "eval_every": args.eval_every,
                         "eval_batches": args.eval_batches,
                         "lr": args.lr,
+                        "current_lr": metric_scalar(last_metrics, "lr"),
+                        "warmup_steps": args.warmup_steps,
+                        "min_lr_ratio": args.min_lr_ratio,
                         "weight_decay": args.weight_decay,
                         "seed": args.seed,
                         "train_sample_seed": args.train_sample_seed,
