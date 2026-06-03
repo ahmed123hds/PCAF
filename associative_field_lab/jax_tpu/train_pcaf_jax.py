@@ -510,32 +510,58 @@ def pcaf_forward_full_ar_target_log_probs(
 
     record_keys = l2_normalize(x @ params["wk"])
     query = l2_normalize(x @ params["wq"])
+    batch_idx = jnp.arange(bsz)[:, None, None]
+    # TPU path intentionally uses the full sequence as one routing chunk.
+    # This keeps the largest XLA matmul shape and avoids CPU-side or loop-heavy
+    # chunking on v4 hardware.
+    routing_chunk = seq_len
 
-    semantic_scores = None
+    def selected_semantic_scores(sem, indices):
+        safe_idx = jnp.maximum(indices, 0)
+        cand_sem = sem[batch_idx, safe_idx]
+        scores = jnp.einsum("btkc,btc->btk", cand_sem, sem)
+        return jnp.where(indices >= 0, scores, 0.0)
+
     semantic_top_idx = None
     semantic_route_scores = None
     if routing_mode in {"semantic_hash", "hybrid_semantic_hash"}:
         sem_logits = x @ params["semantic_w"] + params["semantic_b"]
         temp = max(float(semantic_temperature), 1.0e-4)
         sem = jax.nn.softmax(sem_logits / temp, axis=-1)
-        semantic_scores = jnp.einsum("btc,bsc->bts", sem, sem)
-        semantic_rank_scores = semantic_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
-        semantic_rank_scores = jnp.where(causal[None, :, :], semantic_rank_scores, -1.0e9)
-        _, semantic_top_idx = lax.top_k(semantic_rank_scores, top_k)
-        semantic_route_scores = jnp.take_along_axis(
-            semantic_scores, semantic_top_idx, axis=2
-        )
+        ranking_sem = lax.stop_gradient(sem)
+        semantic_idx_chunks = []
+        for q0 in range(0, seq_len, routing_chunk):
+            q1 = min(q0 + routing_chunk, seq_len)
+            chunk_scores = jnp.einsum(
+                "bqc,bsc->bqs", ranking_sem[:, q0:q1, :], ranking_sem
+            )
+            chunk_scores = chunk_scores + 1.0e-4 * params["recency_scale"] * recency[None, None, :]
+            chunk_scores = jnp.where(causal[q0:q1, :][None, :, :], chunk_scores, -1.0e9)
+            _, chunk_idx = lax.top_k(chunk_scores, top_k)
+            semantic_idx_chunks.append(chunk_idx)
+        semantic_top_idx = jnp.concatenate(semantic_idx_chunks, axis=1)
+        semantic_route_scores = selected_semantic_scores(sem, semantic_top_idx)
 
     if routing_mode in {"token_hash", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, context_order)
         buckets = bucket_hash(context_hashes, num_buckets)
-        bucket_mask = buckets[:, :, None] == buckets[:, None, :]
-        scores = jnp.einsum("btd,bsd->bts", query, record_keys) * (d_model**-0.5)
-        scores = scores + params["recency_scale"] * recency[None, None, :]
-        mask = bucket_mask & causal[None, :, :]
-        masked_scores = jnp.where(mask, scores, -1.0e9)
-        token_top_scores, token_top_idx = lax.top_k(masked_scores, top_k)
-        token_valid = token_top_scores > -1.0e8
+        token_idx_chunks = []
+        token_valid_chunks = []
+        for q0 in range(0, seq_len, routing_chunk):
+            q1 = min(q0 + routing_chunk, seq_len)
+            bucket_mask = buckets[:, q0:q1, None] == buckets[:, None, :]
+            scores = (
+                jnp.einsum("bqd,bsd->bqs", query[:, q0:q1, :], record_keys)
+                * (d_model**-0.5)
+            )
+            scores = scores + params["recency_scale"] * recency[None, None, :]
+            mask = bucket_mask & causal[q0:q1, :][None, :, :]
+            masked_scores = jnp.where(mask, scores, -1.0e9)
+            token_top_scores, token_chunk_idx = lax.top_k(masked_scores, top_k)
+            token_idx_chunks.append(token_chunk_idx)
+            token_valid_chunks.append(token_top_scores > -1.0e8)
+        token_top_idx = jnp.concatenate(token_idx_chunks, axis=1)
+        token_valid = jnp.concatenate(token_valid_chunks, axis=1)
     else:
         token_top_idx = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.int32)
         token_valid = jnp.zeros((bsz, seq_len, top_k), dtype=jnp.bool_)
@@ -549,7 +575,7 @@ def pcaf_forward_full_ar_target_log_probs(
         valid = jnp.concatenate(
             [token_valid, jnp.ones_like(semantic_top_idx, dtype=jnp.bool_)], axis=2
         )
-        token_route_scores = jnp.take_along_axis(semantic_scores, token_top_idx, axis=2)
+        token_route_scores = selected_semantic_scores(sem, token_top_idx)
         candidate_route_scores = jnp.concatenate(
             [token_route_scores, semantic_route_scores], axis=2
         )
@@ -558,7 +584,6 @@ def pcaf_forward_full_ar_target_log_probs(
         valid = token_valid
         candidate_route_scores = None
 
-    batch_idx = jnp.arange(bsz)[:, None, None]
     gathered_keys = record_keys[batch_idx, top_idx]
     cand_tokens = value_tokens[batch_idx, top_idx]
 
