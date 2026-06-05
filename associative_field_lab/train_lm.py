@@ -6,12 +6,14 @@ import math
 import re
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from datasets import load_dataset
 
@@ -136,7 +138,7 @@ class MambaClassifier(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, *, full_ar: bool = False) -> torch.Tensor:
         x = self.embedding(tokens)
         for layer in self.layers:
             mixed = layer["mixer"](layer["norm1"](x))
@@ -144,7 +146,10 @@ class MambaClassifier(nn.Module):
                 mixed = mixed[0]
             x = x + mixed
             x = x + layer["mlp"](layer["norm2"](x))
-        return self.head(self.final_norm(x[:, -1]))
+        h = self.final_norm(x)
+        if full_ar:
+            return self.head(h)          # [B, T, V] — all positions
+        return self.head(h[:, -1])       # [B, V]    — last token only
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +159,8 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "pcaf",
             "pcaf_context",
+            "pcaf_semantic",
+            "pcaf_hybrid",
             "local_conv",
             "transformer",
             "local_transformer",
@@ -187,6 +194,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Use CUDA autocast mixed precision for lower memory and higher throughput.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="CUDA autocast dtype used when --amp is enabled.",
+    )
+    parser.add_argument(
+        "--full-ar-param-chunk-size",
+        type=int,
+        default=0,
+        help="Chunk the full-AR vocabulary head along sequence positions. "
+             "Use with --checkpoint-full-ar-param-head to reduce memory.",
+    )
+    parser.add_argument(
+        "--checkpoint-full-ar-param-head",
+        action="store_true",
+        help="Checkpoint full-AR vocabulary-head chunks, recomputing logits in "
+             "backward instead of storing the whole [B,T,V] graph.",
+    )
+    parser.add_argument(
+        "--routing-chunk-size",
+        type=int,
+        default=512,
+        help="Chunk size for the full-AR routing computation. Reduces peak "
+             "memory from O(B*T^2) to O(B*chunk*T). Larger values are faster "
+             "but use more memory. Set 0 to disable chunking.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--train-sample-seed", type=int, default=10_001)
     parser.add_argument("--eval-sample-seed", type=int, default=20_001)
@@ -274,14 +313,19 @@ def build_model(args: argparse.Namespace, vocab_size: int) -> nn.Module:
             candidate_mode=args.candidate_mode,
             dropout=args.dropout,
         )
-    if args.model == "pcaf_context":
+    if args.model in {"pcaf_context", "pcaf_semantic", "pcaf_hybrid"}:
+        candidate_mode = args.candidate_mode
+        if args.model == "pcaf_semantic":
+            candidate_mode = "semantic_hash"
+        elif args.model == "pcaf_hybrid":
+            candidate_mode = "hybrid_semantic_hash"
         return ContextAssociativeLM(
             vocab_size=vocab_size,
             d_model=args.d_model,
             d_hidden=args.d_hidden,
             num_buckets=args.num_buckets,
             top_k=args.top_k,
-            candidate_mode=args.candidate_mode,
+            candidate_mode=candidate_mode,
             context_order=args.context_order,
             local_layers=args.local_layers,
             local_kernel_size=args.local_kernel_size,
@@ -345,7 +389,45 @@ def target_log_probs_from_logits(logits: torch.Tensor, targets: torch.Tensor) ->
     return target_logits - torch.logsumexp(logits, dim=-1)
 
 
-def transformer_full_ar_logits(model: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+def target_log_probs_from_head(
+    head: nn.Module,
+    states: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    chunk_size: int = 0,
+    checkpoint_chunks: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_len = states.size(1)
+    if chunk_size <= 0 or chunk_size >= seq_len:
+        logits = head(states)
+        return target_log_probs_from_logits(logits, targets), logits.argmax(dim=-1)
+
+    log_prob_chunks = []
+    pred_chunks = []
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        states_chunk = states[:, start:end]
+        targets_chunk = targets[:, start:end]
+
+        def chunk_log_probs(chunk_states: torch.Tensor) -> torch.Tensor:
+            logits = head(chunk_states)
+            return target_log_probs_from_logits(logits, targets_chunk)
+
+        if checkpoint_chunks and torch.is_grad_enabled():
+            log_prob_chunks.append(
+                checkpoint(chunk_log_probs, states_chunk, use_reentrant=False)
+            )
+            with torch.no_grad():
+                pred_chunks.append(head(states_chunk).argmax(dim=-1))
+        else:
+            logits = head(states_chunk)
+            log_prob_chunks.append(target_log_probs_from_logits(logits, targets_chunk))
+            pred_chunks.append(logits.argmax(dim=-1))
+
+    return torch.cat(log_prob_chunks, dim=1), torch.cat(pred_chunks, dim=1)
+
+
+def transformer_full_ar_states(model: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
     seq_len = tokens.size(1)
     if seq_len > model.pos_emb.size(0):
         raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={model.pos_emb.size(0)}")
@@ -355,23 +437,45 @@ def transformer_full_ar_logits(model: nn.Module, tokens: torch.Tensor) -> torch.
         torch.ones(seq_len, seq_len, dtype=torch.bool, device=tokens.device),
         diagonal=1,
     )
-    encoded = model.encoder(x, mask=causal_mask)
-    return model.head(encoded)
+    return model.encoder(x, mask=causal_mask)
+
+
+def transformer_full_ar_logits(model: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    return model.head(transformer_full_ar_states(model, tokens))
+
+
+def mamba_full_ar_states(model: MambaClassifier, tokens: torch.Tensor) -> torch.Tensor:
+    x = model.embedding(tokens)
+    for layer in model.layers:
+        mixed = layer["mixer"](layer["norm1"](x))
+        if isinstance(mixed, tuple):
+            mixed = mixed[0]
+        x = x + mixed
+        x = x + layer["mlp"](layer["norm2"](x))
+    return model.final_norm(x)
 
 
 def pcaf_context_full_ar_target_log_probs(
     model: ContextAssociativeLM,
     tokens: torch.Tensor,
     targets: torch.Tensor,
+    *,
+    param_chunk_size: int = 0,
+    checkpoint_param_head: bool = False,
+    routing_chunk_size: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x = model.token_emb(tokens)
     for block in model.local_blocks:
         x = block(x)
 
     states = x
-    param_logits = model.param_head(states)
-    target_param_log_probs = target_log_probs_from_logits(param_logits, targets)
-    pred = param_logits.argmax(dim=-1)
+    target_param_log_probs, pred = target_log_probs_from_head(
+        model.param_head,
+        states,
+        targets,
+        chunk_size=param_chunk_size,
+        checkpoint_chunks=checkpoint_param_head,
+    )
     acc = (pred == targets).float().mean()
     if not model.use_cache:
         return target_param_log_probs, acc
@@ -386,37 +490,79 @@ def pcaf_context_full_ar_target_log_probs(
     pos = torch.arange(seq_len, device=tokens.device)
     causal = pos.unsqueeze(0) < pos.unsqueeze(1)
     recency = pos.float() / max(float(seq_len - 1), 1.0)
+    batch_idx = torch.arange(batch, device=tokens.device)[:, None, None]
 
-    semantic_scores = None
+    def selected_semantic_scores(
+        semantic_probs: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        safe_indices = indices.clamp_min(0)
+        cand_semantic_probs = semantic_probs[batch_idx, safe_indices]
+        scores = (semantic_probs.unsqueeze(2) * cand_semantic_probs).sum(dim=-1)
+        return scores.masked_fill(indices < 0, 0.0)
+
+    # ---------- routing chunk size (0 = full, else chunk along query dim) ---
+    rc = routing_chunk_size if routing_chunk_size > 0 else seq_len
+
+    semantic_probs = None
     semantic_idx = None
     semantic_route_scores = None
     if model.candidate_mode in {"semantic_hash", "hybrid_semantic_hash"}:
         semantic_logits = model.semantic_router(states)
         temperature = max(float(model.semantic_temperature), 1.0e-4)
         semantic_probs = torch.softmax(semantic_logits / temperature, dim=-1)
-        semantic_scores = torch.einsum("btc,bsc->bts", semantic_probs, semantic_probs)
-        route_scores = semantic_scores + 1.0e-4 * model.recency_scale * recency.view(1, 1, -1)
-        route_scores = route_scores.masked_fill(~causal.view(1, seq_len, seq_len), -1.0e9)
+        ranking_probs = semantic_probs.detach()
         k = seq_len if model.top_k <= 0 else min(model.top_k, seq_len)
-        _, semantic_idx = route_scores.topk(k, dim=2)
-        semantic_route_scores = semantic_scores.gather(dim=2, index=semantic_idx)
+        # --- chunked semantic routing: avoids [B, T, T] allocation ----------
+        sem_idx_chunks = []
+        for q0 in range(0, seq_len, rc):
+            q1 = min(q0 + rc, seq_len)
+            # [B, chunk, C] x [B, T, C] -> [B, chunk, T]
+            ch_scores = torch.einsum(
+                "bqc,bsc->bqs", ranking_probs[:, q0:q1], ranking_probs
+            )
+            ch_scores = ch_scores + 1.0e-4 * model.recency_scale * recency.view(1, 1, -1)
+            ch_scores = ch_scores.masked_fill(
+                ~causal[q0:q1, :].unsqueeze(0), -1.0e9
+            )
+            _, ch_idx = ch_scores.topk(k, dim=2)
+            sem_idx_chunks.append(ch_idx)
+        semantic_idx = torch.cat(sem_idx_chunks, dim=1)
+        semantic_route_scores = selected_semantic_scores(semantic_probs, semantic_idx)
 
     if model.candidate_mode in {"hash", "triton_hash", "oracle", "full", "hybrid_semantic_hash"}:
         context_hashes = causal_ngram_hash(tokens, model.context_order)
-        if model.candidate_mode == "oracle":
-            candidate_mask = context_hashes[:, :, None] == context_hashes[:, None, :]
-        elif model.candidate_mode == "full":
-            candidate_mask = torch.ones(batch, seq_len, seq_len, dtype=torch.bool, device=tokens.device)
-        else:
-            buckets = torch.remainder(context_hashes.long() * 1_000_003 + 97_531, model.num_buckets)
-            candidate_mask = buckets[:, :, None] == buckets[:, None, :]
-        candidate_mask = candidate_mask & causal.view(1, seq_len, seq_len)
-        scores = torch.einsum("btd,bsd->bts", query, record_keys) * model.scale
-        scores = scores + model.recency_scale * recency.view(1, 1, -1)
-        scores = scores.masked_fill(~candidate_mask, -1.0e9)
         k = seq_len if model.top_k <= 0 else min(model.top_k, seq_len)
-        top_scores, token_idx = scores.topk(k, dim=2)
-        token_valid = top_scores > -1.0e8
+        # pre-compute bucket ids (small: [B, T])
+        if model.candidate_mode not in {"oracle", "full"}:
+            all_buckets = torch.remainder(
+                context_hashes.long() * 1_000_003 + 97_531, model.num_buckets
+            )
+        # --- chunked hash routing: avoids [B, T, T] allocation --------------
+        tok_idx_chunks = []
+        tok_valid_chunks = []
+        for q0 in range(0, seq_len, rc):
+            q1 = min(q0 + rc, seq_len)
+            if model.candidate_mode == "oracle":
+                ch_mask = context_hashes[:, q0:q1, None] == context_hashes[:, None, :]
+            elif model.candidate_mode == "full":
+                ch_mask = torch.ones(
+                    batch, q1 - q0, seq_len, dtype=torch.bool, device=tokens.device
+                )
+            else:
+                ch_mask = all_buckets[:, q0:q1, None] == all_buckets[:, None, :]
+            ch_mask = ch_mask & causal[q0:q1, :].unsqueeze(0)
+            ch_scores = (
+                torch.einsum("bqd,bsd->bqs", query[:, q0:q1], record_keys)
+                * model.scale
+            )
+            ch_scores = ch_scores + model.recency_scale * recency.view(1, 1, -1)
+            ch_scores = ch_scores.masked_fill(~ch_mask, -1.0e9)
+            ch_top, ch_idx = ch_scores.topk(k, dim=2)
+            tok_idx_chunks.append(ch_idx)
+            tok_valid_chunks.append(ch_top > -1.0e8)
+        token_idx = torch.cat(tok_idx_chunks, dim=1)
+        token_valid = torch.cat(tok_valid_chunks, dim=1)
     else:
         token_idx = torch.zeros(batch, seq_len, model.top_k, dtype=torch.long, device=tokens.device)
         token_valid = torch.zeros_like(token_idx, dtype=torch.bool)
@@ -426,7 +572,7 @@ def pcaf_context_full_ar_target_log_probs(
         valid = torch.ones_like(candidate_idx, dtype=torch.bool)
         candidate_route_scores = semantic_route_scores
     elif model.candidate_mode == "hybrid_semantic_hash":
-        token_route_scores = semantic_scores.gather(dim=2, index=token_idx)
+        token_route_scores = selected_semantic_scores(semantic_probs, token_idx)
         candidate_idx = torch.cat([token_idx, semantic_idx], dim=2)
         valid = torch.cat([token_valid, torch.ones_like(semantic_idx, dtype=torch.bool)], dim=2)
         candidate_route_scores = torch.cat([token_route_scores, semantic_route_scores], dim=2)
@@ -436,13 +582,8 @@ def pcaf_context_full_ar_target_log_probs(
         candidate_route_scores = None
 
     safe_idx = candidate_idx.clamp_min(0)
-    gather_key_idx = safe_idx.unsqueeze(-1).expand(-1, -1, -1, record_keys.size(-1))
-    cand_keys = record_keys.unsqueeze(1).expand(-1, seq_len, -1, -1).gather(
-        dim=2, index=gather_key_idx
-    )
-    cand_tokens = value_tokens.unsqueeze(1).expand(-1, seq_len, -1).gather(
-        dim=2, index=safe_idx
-    )
+    cand_keys = record_keys[batch_idx, safe_idx]
+    cand_tokens = value_tokens[batch_idx, safe_idx]
 
     cache_scores = torch.einsum("btkd,btd->btk", cand_keys, query) * model.scale
     cache_scores = cache_scores + model.recency_scale * (
@@ -471,14 +612,48 @@ def pcaf_context_full_ar_target_log_probs(
     return torch.log(target_mix_probs.clamp_min(1.0e-8)), acc
 
 
-def full_ar_loss_and_acc(model: nn.Module, tokens: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def full_ar_loss_and_acc(
+    model: nn.Module,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    param_chunk_size: int = 0,
+    checkpoint_param_head: bool = False,
+    routing_chunk_size: int = 512,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(model, ContextAssociativeLM):
-        target_log_probs, acc = pcaf_context_full_ar_target_log_probs(model, tokens, targets)
+        target_log_probs, acc = pcaf_context_full_ar_target_log_probs(
+            model,
+            tokens,
+            targets,
+            param_chunk_size=param_chunk_size,
+            checkpoint_param_head=checkpoint_param_head,
+            routing_chunk_size=routing_chunk_size,
+        )
         return -target_log_probs.mean(), acc
     if isinstance(model, TransformerClassifier):
-        logits = transformer_full_ar_logits(model, tokens)
-        loss = -target_log_probs_from_logits(logits, targets).mean()
-        acc = (logits.argmax(dim=-1) == targets).float().mean()
+        states = transformer_full_ar_states(model, tokens)
+        target_log_probs, pred = target_log_probs_from_head(
+            model.head,
+            states,
+            targets,
+            chunk_size=param_chunk_size,
+            checkpoint_chunks=checkpoint_param_head,
+        )
+        loss = -target_log_probs.mean()
+        acc = (pred == targets).float().mean()
+        return loss, acc
+    if isinstance(model, MambaClassifier):
+        states = mamba_full_ar_states(model, tokens)
+        target_log_probs, pred = target_log_probs_from_head(
+            model.head,
+            states,
+            targets,
+            chunk_size=param_chunk_size,
+            checkpoint_chunks=checkpoint_param_head,
+        )
+        loss = -target_log_probs.mean()
+        acc = (pred == targets).float().mean()
         return loss, acc
     logits = model(tokens)
     loss = F.cross_entropy(logits, targets[:, -1])
@@ -496,19 +671,43 @@ def append_jsonl(path: str, row: dict) -> None:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, batcher: RandomTokenBatcher, *, batches: int, loss_mode: str) -> tuple[float, float]:
+def evaluate(
+    model: nn.Module,
+    batcher: RandomTokenBatcher,
+    *,
+    batches: int,
+    loss_mode: str,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    param_chunk_size: int = 0,
+    checkpoint_param_head: bool = False,
+    routing_chunk_size: int = 512,
+) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_acc = 0.0
     total = 0
     for _ in range(batches):
         tokens, targets = batcher.sample()
-        if loss_mode == "full_ar":
-            loss, acc = full_ar_loss_and_acc(model, tokens, targets)
-        else:
-            logits = model(tokens)
-            loss = F.cross_entropy(logits, targets)
-            acc = (logits.argmax(dim=-1) == targets).float().mean()
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=amp_dtype)
+            if amp_enabled
+            else nullcontext()
+        )
+        with autocast_ctx:
+            if loss_mode == "full_ar":
+                loss, acc = full_ar_loss_and_acc(
+                    model,
+                    tokens,
+                    targets,
+                    param_chunk_size=param_chunk_size,
+                    checkpoint_param_head=checkpoint_param_head,
+                    routing_chunk_size=routing_chunk_size,
+                )
+            else:
+                logits = model(tokens)
+                loss = F.cross_entropy(logits, targets)
+                acc = (logits.argmax(dim=-1) == targets).float().mean()
         weight = targets.numel() if loss_mode == "full_ar" else targets.size(0)
         total_loss += float(loss.item()) * weight
         total_acc += float(acc.item()) * weight
@@ -551,6 +750,12 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled and amp_dtype == torch.float16
+    )
     n_params = sum(p.numel() for p in model.parameters())
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -570,19 +775,40 @@ def main() -> None:
         step_start = time.perf_counter()
         model.train()
         tokens, targets = train_batcher.sample()
-        if args.loss_mode == "full_ar":
-            loss, train_acc_tensor = full_ar_loss_and_acc(model, tokens, targets)
-            train_acc_value = float(train_acc_tensor.detach().item())
-        else:
-            logits = model(tokens)
-            loss = F.cross_entropy(logits, targets)
-            train_acc_value = float((logits.argmax(dim=-1) == targets).float().mean().item())
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=amp_dtype)
+            if amp_enabled
+            else nullcontext()
+        )
+        with autocast_ctx:
+            if args.loss_mode == "full_ar":
+                loss, train_acc_tensor = full_ar_loss_and_acc(
+                    model,
+                    tokens,
+                    targets,
+                    param_chunk_size=args.full_ar_param_chunk_size,
+                    checkpoint_param_head=args.checkpoint_full_ar_param_head,
+                    routing_chunk_size=args.routing_chunk_size,
+                )
+                train_acc_value = float(train_acc_tensor.detach().item())
+            else:
+                logits = model(tokens)
+                loss = F.cross_entropy(logits, targets)
+                train_acc_value = float((logits.argmax(dim=-1) == targets).float().mean().item())
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         step_elapsed = time.perf_counter() - step_start
@@ -590,7 +816,15 @@ def main() -> None:
         if step == 1 or step % args.eval_every == 0:
             eval_start = time.perf_counter()
             eval_loss, eval_acc = evaluate(
-                model, eval_batcher, batches=args.eval_batches, loss_mode=args.loss_mode
+                model,
+                eval_batcher,
+                batches=args.eval_batches,
+                loss_mode=args.loss_mode,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+                param_chunk_size=args.full_ar_param_chunk_size,
+                checkpoint_param_head=args.checkpoint_full_ar_param_head,
+                routing_chunk_size=args.routing_chunk_size,
             )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -656,6 +890,10 @@ def main() -> None:
                     "semantic_score_scale": args.semantic_score_scale,
                     "local_layers": args.local_layers,
                     "local_kernel_size": args.local_kernel_size,
+                    "amp": amp_enabled,
+                    "amp_dtype": args.amp_dtype if amp_enabled else "",
+                    "full_ar_param_chunk_size": args.full_ar_param_chunk_size,
+                    "checkpoint_full_ar_param_head": args.checkpoint_full_ar_param_head,
                     "use_cache": not args.no_cache,
                     "use_gate": not args.no_gate,
                     "fixed_cache_weight": args.fixed_cache_weight,
