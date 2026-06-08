@@ -858,7 +858,7 @@ def learning_rate_at_step(
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
-def make_train_step(cfg, weight_decay: float):
+def make_train_step(cfg, weight_decay: float, adam_beta1: float, adam_beta2: float):
     def train_step(params, opt_state, tokens, targets, lr):
         (loss, metrics), grads = jax.value_and_grad(loss_and_metrics, has_aux=True)(
             params, tokens, targets, cfg
@@ -866,7 +866,13 @@ def make_train_step(cfg, weight_decay: float):
         grads = lax.pmean(grads, axis_name="data")
         metrics = lax.pmean(metrics, axis_name="data")
         params, opt_state = adamw_update(
-            params, grads, opt_state, lr=lr, weight_decay=weight_decay
+            params,
+            grads,
+            opt_state,
+            lr=lr,
+            weight_decay=weight_decay,
+            b1=adam_beta1,
+            b2=adam_beta2,
         )
         metrics = dict(metrics)
         metrics["lr"] = lax.pmean(lr, axis_name="data")
@@ -947,6 +953,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--min-lr-ratio", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--train-sample-seed", type=int, default=10001)
     parser.add_argument("--eval-sample-seed", type=int, default=20001)
@@ -1091,7 +1099,7 @@ def main() -> None:
         "global_tokens": args.global_tokens,
         "linear_chunk_size": args.linear_chunk_size,
     }
-    train_step = make_train_step(cfg, args.weight_decay)
+    train_step = make_train_step(cfg, args.weight_decay, args.adam_beta1, args.adam_beta2)
     eval_step = make_eval_step(cfg)
 
     if process_index == 0:
@@ -1113,7 +1121,8 @@ def main() -> None:
         )
         print(
             f"lr={args.lr} warmup_steps={args.warmup_steps} "
-            f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay}"
+            f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
+            f"adam_beta1={args.adam_beta1} adam_beta2={args.adam_beta2}"
         )
 
     run_start = time.perf_counter()
@@ -1195,6 +1204,8 @@ def main() -> None:
                         "warmup_steps": args.warmup_steps,
                         "min_lr_ratio": args.min_lr_ratio,
                         "weight_decay": args.weight_decay,
+                        "adam_beta1": args.adam_beta1,
+                        "adam_beta2": args.adam_beta2,
                         "seed": args.seed,
                         "train_sample_seed": args.train_sample_seed,
                         "eval_sample_seed": args.eval_sample_seed,
