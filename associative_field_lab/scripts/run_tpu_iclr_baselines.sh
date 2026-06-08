@@ -31,6 +31,9 @@ SEQ_LENS="${SEQ_LENS:-1024 2048}"
 STEPS="${STEPS:-20000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
 EVAL_BATCHES="${EVAL_BATCHES:-100}"
+KV_RECALL_EVAL="${KV_RECALL_EVAL:-0}"
+KV_RECALL_PAIRS="${KV_RECALL_PAIRS:-64}"
+KV_RECALL_BATCHES="${KV_RECALL_BATCHES:-20}"
 LR="${LR:-0.0003}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
 MIN_LR_RATIO="${MIN_LR_RATIO:-1.0}"
@@ -105,6 +108,14 @@ common_args=(
   --eval-sample-seed "$EVAL_SAMPLE_SEED"
   --loss-mode "${LOSS_MODE:-last_token}"
 )
+
+if [[ "$KV_RECALL_EVAL" == "1" ]]; then
+  common_args+=(
+    --kv-recall-eval
+    --kv-recall-pairs "$KV_RECALL_PAIRS"
+    --kv-recall-batches "$KV_RECALL_BATCHES"
+  )
+fi
 
 attention_batch_for_seq() {
   local seq_len="$1"

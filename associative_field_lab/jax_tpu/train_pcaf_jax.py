@@ -82,6 +82,55 @@ class HostBatcher:
         )
 
 
+class HostKVRecallBatcher:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        seq_len: int,
+        num_pairs: int,
+        per_process_batch: int,
+        local_device_count: int,
+        seed: int,
+    ) -> None:
+        if per_process_batch % local_device_count != 0:
+            raise ValueError("per-process batch must divide local_device_count")
+        if 2 * num_pairs + 1 > seq_len:
+            raise ValueError("kv-recall pairs do not fit in seq_len")
+        if vocab_size <= 3 + num_pairs:
+            raise ValueError("vocab too small for kv-recall")
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.num_pairs = num_pairs
+        self.per_process_batch = per_process_batch
+        self.local_device_count = local_device_count
+        self.per_device_batch = per_process_batch // local_device_count
+        self.rng = np.random.default_rng(seed)
+
+    def sample(self) -> tuple[np.ndarray, np.ndarray]:
+        tokens = self.rng.integers(
+            3,
+            self.vocab_size,
+            size=(self.per_process_batch, self.seq_len),
+            dtype=np.int32,
+        )
+        targets = np.empty((self.per_process_batch,), dtype=np.int32)
+        start = self.seq_len - (2 * self.num_pairs + 1)
+        vocab_ids = np.arange(3, self.vocab_size, dtype=np.int32)
+        for row in range(self.per_process_batch):
+            keys = self.rng.choice(vocab_ids, size=self.num_pairs, replace=False)
+            values = self.rng.integers(3, self.vocab_size, size=self.num_pairs, dtype=np.int32)
+            query_slot = int(self.rng.integers(0, self.num_pairs))
+            pair_block = np.empty((2 * self.num_pairs,), dtype=np.int32)
+            pair_block[0::2] = keys
+            pair_block[1::2] = values
+            tokens[row, start : start + 2 * self.num_pairs] = pair_block
+            tokens[row, -1] = keys[query_slot]
+            targets[row] = values[query_slot]
+        shard_shape = (self.local_device_count, self.per_device_batch)
+        return tokens.reshape(*shard_shape, self.seq_len), targets.reshape(*shard_shape)
+
+
 def iter_texts(dataset_split, text_field: str = "text") -> list[str]:
     """Extract text strings from a HuggingFace dataset split.
 
@@ -840,6 +889,41 @@ def loss_and_metrics(params, tokens, targets, cfg):
     return loss, {"loss": loss, "acc": acc}
 
 
+def last_token_loss_and_metrics(params, tokens, targets, cfg):
+    if cfg["model_family"] == "transformer":
+        log_probs = transformer_forward(
+            params,
+            tokens,
+            heads=cfg["heads"],
+            attention_mode=cfg["attention_mode"],
+            window_size=cfg["attention_window"],
+            global_tokens=cfg["global_tokens"],
+            linear_chunk_size=cfg["linear_chunk_size"],
+        )
+    else:
+        log_probs = pcaf_forward(
+            params,
+            tokens,
+            vocab_size=cfg["vocab_size"],
+            d_model=cfg["d_model"],
+            num_buckets=cfg["num_buckets"],
+            top_k=cfg["top_k"],
+            context_order=cfg["context_order"],
+            routing_mode=cfg["routing_mode"],
+            semantic_buckets=cfg["semantic_buckets"],
+            semantic_temperature=cfg["semantic_temperature"],
+            semantic_score_scale=cfg["semantic_score_scale"],
+            use_cache=cfg["use_cache"],
+            use_gate=cfg["use_gate"],
+            fixed_cache_weight=cfg["fixed_cache_weight"],
+        )
+    target_log_probs = jnp.take_along_axis(log_probs, targets[:, None], axis=1)[:, 0]
+    loss = -jnp.mean(target_log_probs)
+    pred = jnp.argmax(log_probs, axis=-1)
+    acc = jnp.mean((pred == targets).astype(jnp.float32))
+    return loss, {"loss": loss, "acc": acc}
+
+
 def learning_rate_at_step(
     step: int,
     *,
@@ -884,6 +968,14 @@ def make_train_step(cfg, weight_decay: float, adam_beta1: float, adam_beta2: flo
 def make_eval_step(cfg):
     def eval_step(params, tokens, targets):
         _, metrics = loss_and_metrics(params, tokens, targets, cfg)
+        return lax.pmean(metrics, axis_name="data")
+
+    return jax.pmap(eval_step, axis_name="data")
+
+
+def make_kv_recall_eval_step(cfg):
+    def eval_step(params, tokens, targets):
+        _, metrics = last_token_loss_and_metrics(params, tokens, targets, cfg)
         return lax.pmean(metrics, axis_name="data")
 
     return jax.pmap(eval_step, axis_name="data")
@@ -949,6 +1041,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-batches", type=int, default=50)
+    parser.add_argument("--kv-recall-eval", action="store_true")
+    parser.add_argument("--kv-recall-pairs", type=int, default=64)
+    parser.add_argument("--kv-recall-batches", type=int, default=20)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--min-lr-ratio", type=float, default=1.0)
@@ -1025,6 +1120,16 @@ def main() -> None:
         seed=args.eval_sample_seed + process_index,
         full_ar=args.loss_mode == "full_ar",
     )
+    kv_recall_batcher = None
+    if args.kv_recall_eval:
+        kv_recall_batcher = HostKVRecallBatcher(
+            vocab_size=vocab.size,
+            seq_len=args.seq_len,
+            num_pairs=args.kv_recall_pairs,
+            per_process_batch=per_process_batch,
+            local_device_count=local_device_count,
+            seed=args.eval_sample_seed + 50_000 + process_index,
+        )
 
     key = random.PRNGKey(args.seed)
     transformer_models = {
@@ -1101,6 +1206,7 @@ def main() -> None:
     }
     train_step = make_train_step(cfg, args.weight_decay, args.adam_beta1, args.adam_beta2)
     eval_step = make_eval_step(cfg)
+    kv_recall_eval_step = make_kv_recall_eval_step(cfg) if args.kv_recall_eval else None
 
     if process_index == 0:
         print(
@@ -1124,6 +1230,11 @@ def main() -> None:
             f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
             f"adam_beta1={args.adam_beta1} adam_beta2={args.adam_beta2}"
         )
+        if args.kv_recall_eval:
+            print(
+                f"kv_recall_eval=True kv_pairs={args.kv_recall_pairs} "
+                f"kv_batches={args.kv_recall_batches}"
+            )
 
     run_start = time.perf_counter()
     last_log_time = run_start
@@ -1156,6 +1267,21 @@ def main() -> None:
                 eval_acc += metric_scalar(metrics, "acc")
             eval_loss /= args.eval_batches
             eval_acc /= args.eval_batches
+            kv_recall_loss = None
+            kv_recall_acc = None
+            kv_recall_ppl = None
+            if kv_recall_batcher is not None and kv_recall_eval_step is not None:
+                kv_recall_loss = 0.0
+                kv_recall_acc = 0.0
+                for _ in range(args.kv_recall_batches):
+                    kv_tokens_np, kv_targets_np = kv_recall_batcher.sample()
+                    kv_metrics = kv_recall_eval_step(params, kv_tokens_np, kv_targets_np)
+                    _ = jax.tree_util.tree_map(lambda x: x.block_until_ready(), kv_metrics)
+                    kv_recall_loss += metric_scalar(kv_metrics, "loss")
+                    kv_recall_acc += metric_scalar(kv_metrics, "acc")
+                kv_recall_loss /= args.kv_recall_batches
+                kv_recall_acc /= args.kv_recall_batches
+                kv_recall_ppl = math.exp(min(20.0, kv_recall_loss))
             now = time.perf_counter()
             eval_sec = now - eval_start
             interval_steps = 1 if step == 1 else args.eval_every
@@ -1178,66 +1304,83 @@ def main() -> None:
                     f"train_step_sec={train_step_sec:.4f} tok_per_sec={tok_per_sec:.1f} "
                     f"eval_sec={eval_sec:.2f} elapsed_min={(now - run_start) / 60.0:.2f}"
                 )
+                row = {
+                    "step": step,
+                    "model": args.model,
+                    "loss_mode": args.loss_mode,
+                    "dataset": args.dataset,
+                    "dataset_config": dataset_config or "",
+                    "eval_split": eval_split,
+                    "params": n_params,
+                    "seq_len": args.seq_len,
+                    "global_batch_size": args.global_batch_size,
+                    "batch_size": args.global_batch_size,
+                    "per_process_batch": per_process_batch,
+                    "per_device_batch": train_batcher.per_device_batch,
+                    "max_vocab": args.max_vocab,
+                    "train_tokens": len(train_ids),
+                    "eval_tokens": len(eval_ids),
+                    "steps_total": args.steps,
+                    "eval_every": args.eval_every,
+                    "eval_batches": args.eval_batches,
+                    "lr": args.lr,
+                    "current_lr": metric_scalar(last_metrics, "lr"),
+                    "warmup_steps": args.warmup_steps,
+                    "min_lr_ratio": args.min_lr_ratio,
+                    "weight_decay": args.weight_decay,
+                    "adam_beta1": args.adam_beta1,
+                    "adam_beta2": args.adam_beta2,
+                    "seed": args.seed,
+                    "train_sample_seed": args.train_sample_seed,
+                    "eval_sample_seed": args.eval_sample_seed,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "eval_loss": eval_loss,
+                    "eval_ppl": ppl,
+                    "eval_acc": eval_acc,
+                    "train_step_sec": train_step_sec,
+                    "train_tokens_per_sec": tok_per_sec,
+                    "eval_sec": eval_sec,
+                    "elapsed_sec": now - run_start,
+                    "d_model": args.d_model,
+                    "d_hidden": args.d_hidden,
+                    "local_layers": args.local_layers,
+                    "local_kernel_size": args.local_kernel_size,
+                    "layers": args.layers,
+                    "heads": args.heads,
+                    "attention_mode": attention_mode,
+                    "attention_window": args.attention_window,
+                    "global_tokens": args.global_tokens,
+                    "linear_chunk_size": args.linear_chunk_size,
+                    "num_buckets": args.num_buckets,
+                    "top_k": args.top_k,
+                    "context_order": args.context_order,
+                    "routing_mode": routing_mode,
+                    "semantic_buckets": args.semantic_buckets,
+                    "semantic_temperature": args.semantic_temperature,
+                    "semantic_score_scale": args.semantic_score_scale,
+                    "use_cache": use_cache,
+                    "use_gate": use_gate,
+                }
+                if kv_recall_loss is not None:
+                    print(
+                        f"kv_recall_loss={kv_recall_loss:.4f} "
+                        f"kv_recall_ppl={kv_recall_ppl:.2f} "
+                        f"kv_recall_acc={kv_recall_acc:.4f}"
+                    )
+                    row.update(
+                        {
+                            "kv_recall_eval": True,
+                            "kv_recall_pairs": args.kv_recall_pairs,
+                            "kv_recall_batches": args.kv_recall_batches,
+                            "kv_recall_loss": kv_recall_loss,
+                            "kv_recall_ppl": kv_recall_ppl,
+                            "kv_recall_acc": kv_recall_acc,
+                        }
+                    )
                 append_jsonl(
                     args.log_jsonl,
-                    {
-                        "step": step,
-                        "model": args.model,
-                        "loss_mode": args.loss_mode,
-                        "dataset": args.dataset,
-                        "dataset_config": dataset_config or "",
-                        "eval_split": eval_split,
-                        "params": n_params,
-                        "seq_len": args.seq_len,
-                        "global_batch_size": args.global_batch_size,
-                        "batch_size": args.global_batch_size,
-                        "per_process_batch": per_process_batch,
-                        "per_device_batch": train_batcher.per_device_batch,
-                        "max_vocab": args.max_vocab,
-                        "train_tokens": len(train_ids),
-                        "eval_tokens": len(eval_ids),
-                        "steps_total": args.steps,
-                        "eval_every": args.eval_every,
-                        "eval_batches": args.eval_batches,
-                        "lr": args.lr,
-                        "current_lr": metric_scalar(last_metrics, "lr"),
-                        "warmup_steps": args.warmup_steps,
-                        "min_lr_ratio": args.min_lr_ratio,
-                        "weight_decay": args.weight_decay,
-                        "adam_beta1": args.adam_beta1,
-                        "adam_beta2": args.adam_beta2,
-                        "seed": args.seed,
-                        "train_sample_seed": args.train_sample_seed,
-                        "eval_sample_seed": args.eval_sample_seed,
-                        "train_loss": train_loss,
-                        "train_acc": train_acc,
-                        "eval_loss": eval_loss,
-                        "eval_ppl": ppl,
-                        "eval_acc": eval_acc,
-                        "train_step_sec": train_step_sec,
-                        "train_tokens_per_sec": tok_per_sec,
-                        "eval_sec": eval_sec,
-                        "elapsed_sec": now - run_start,
-                        "d_model": args.d_model,
-                        "d_hidden": args.d_hidden,
-                        "local_layers": args.local_layers,
-                        "local_kernel_size": args.local_kernel_size,
-                        "layers": args.layers,
-                        "heads": args.heads,
-                        "attention_mode": attention_mode,
-                        "attention_window": args.attention_window,
-                        "global_tokens": args.global_tokens,
-                        "linear_chunk_size": args.linear_chunk_size,
-                        "num_buckets": args.num_buckets,
-                        "top_k": args.top_k,
-                        "context_order": args.context_order,
-                        "routing_mode": routing_mode,
-                        "semantic_buckets": args.semantic_buckets,
-                        "semantic_temperature": args.semantic_temperature,
-                        "semantic_score_scale": args.semantic_score_scale,
-                        "use_cache": use_cache,
-                        "use_gate": use_gate,
-                    },
+                    row,
                 )
             last_log_time = now
 
