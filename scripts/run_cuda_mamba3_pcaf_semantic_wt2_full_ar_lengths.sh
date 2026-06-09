@@ -18,7 +18,7 @@ set -u
 #   chunked vocabulary head. PCAF routing uses --routing-chunk-size 0, which
 #   means "full routing chunk" rather than small Python-side routing chunks.
 
-PYTHON_BIN="${PYTHON_BIN:-$HOME/Downloads/Documents/Work/Research/CVPR/pytorch_env/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 LOG_ROOT="${LOG_ROOT:-logs/cuda_wt2_full_ar_mamba3_pcaf_semantic_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "$LOG_ROOT"

@@ -29,12 +29,41 @@ roughly `1 / num_classes`.
 
 ## Install
 
-Create an environment and install the dependencies:
+Create an environment, then install the CUDA/PyTorch dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+```
+
+For TPU/JAX experiments, use a separate environment:
+
+```bash
+python -m pip install -r requirements-tpu.txt \
+  -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+## Reproduce Headline Results
+
+The paper's 303M-parameter full-autoregressive WikiText-103 and PG-19 sweep is
+encoded in one TPU v4-32 runner:
+
+```bash
+gcloud compute tpus tpu-vm ssh TPU_NAME \
+  --zone=ZONE \
+  --project=PROJECT \
+  --worker=all \
+  --command='cd ~/models/PCAF && git pull --ff-only && bash scripts/run_tpu_300m_dataset_schedule.sh'
+```
+
+The script uses the paper's model shapes, seeds, optimizer schedules, and
+dataset-specific training budgets. It prints the run directory and writes
+`paper_ready_results.md` and `paper_ready_tables.tex` there. For the
+single-GPU WikiText-2 Mamba-3/PCAF length sweep, run:
+
+```bash
+PYTHON_BIN=python bash scripts/run_cuda_mamba3_pcaf_semantic_wt2_full_ar_lengths.sh
 ```
 
 ## No-Torch Smoke Test
@@ -79,6 +108,10 @@ Use `--candidate-mode triton_hash` to train through the sparse bucket path. The
 fused sparse-read kernel is forward-only for inference/benchmarking; training
 uses PyTorch gather/softmax after Triton candidate selection so autograd remains
 correct.
+
+## License
+
+PCAF is released under the [Apache License 2.0](LICENSE).
 
 ## Train The Proposed Model
 

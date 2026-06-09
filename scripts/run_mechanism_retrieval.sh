@@ -5,7 +5,7 @@ set -u
 # These isolate sparse associative retrieval from language-modeling shortcuts.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${PYTHON:-$HOME/Downloads/Documents/Work/Research/CVPR/pytorch_env/bin/python}"
+PYTHON="${PYTHON:-python}"
 TRAIN="$ROOT_DIR/train.py"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs/mechanism_$(date +%Y%m%d_%H%M%S)}"
 DEVICE="${DEVICE:-cuda}"

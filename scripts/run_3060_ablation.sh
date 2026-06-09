@@ -11,7 +11,7 @@ set -u
 #   PYTHON=/path/to/python BATCH_PCAF=64 BATCH_ATTENTION=16 bash ...
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${PYTHON:-$HOME/Downloads/Documents/Work/Research/CVPR/pytorch_env/bin/python}"
+PYTHON="${PYTHON:-python}"
 TRAIN="$ROOT_DIR/train_lm.py"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs/rtx3060_$(date +%Y%m%d_%H%M%S)}"
 

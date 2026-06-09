@@ -1,0 +1,4 @@
+datasets>=2.18
+jax[tpu]>=0.4.30
+matplotlib>=3.7
+numpy>=1.24
