@@ -226,6 +226,17 @@ discrete successor records and reads a bounded candidate set by address,
 avoiding the fixed-state bottleneck at the cost of per-window memory
 allocation.
 
+\paragraph{Sparse random access for recurrent models.}
+RAMba augments Mamba with hardware-aligned hierarchical sparse attention to
+restore random access to long histories \citep{hu2025ramba}. It partitions the
+sequence into chunks, selects relevant chunks using token-level relevance
+signals, and hierarchically aggregates their contents. This approach and PCAF
+share the objective of avoiding exclusive dependence on a fixed recurrent
+state. Their memory mechanisms differ: RAMba adds learned sparse attention over
+selected chunks, whereas PCAF constructs causal successor records and performs
+a bounded content-addressed read whose retrieved token distribution is combined
+with a local parametric model.
+
 \paragraph{Cache and retrieval language models.}
 Cache language models exploit the burstiness of natural language by boosting
 the probability of recently observed words. Continuous cache models store past

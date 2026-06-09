@@ -1,4 +1,4 @@
-\begin{thebibliography}{24}
+\begin{thebibliography}{25}
 \providecommand{\natexlab}[1]{#1}
 \providecommand{\url}[1]{\texttt{#1}}
 \expandafter\ifx\csname urlstyle\endcsname\relax
@@ -73,6 +73,13 @@ Albert Gu and Tri Dao.
 Albert Gu, Karan Goel, and Christopher R\'{e}.
 \newblock Efficiently modeling long sequences with structured state spaces.
 \newblock \emph{arXiv preprint arXiv:2111.00396}, 2021.
+
+\bibitem[Hu et~al.(2025)Hu, Leng, Zhao, Tu, and Wu]{hu2025ramba}
+Xiang Hu, Jiaqi Leng, Jun Zhao, Kewei Tu, and Wei Wu.
+\newblock Hardware-aligned hierarchical sparse attention for efficient
+  long-term memory access.
+\newblock \emph{arXiv preprint arXiv:2504.16795}, 2025.
+\newblock Accepted at NeurIPS 2025.
 
 \bibitem[Izacard et~al.(2023)Izacard, Lewis, Lomeli, Hosseini, Petroni, Schick,
   Dwivedi-Yu, Joulin, Riedel, and Grave]{izacard2022atlas}
