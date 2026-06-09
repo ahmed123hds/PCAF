@@ -104,15 +104,30 @@ inspiration from memory-augmented neural networks
 language models \citep{borgeaud2022retro,izacard2022atlas}, but operates
 \emph{within} a single context window without an external corpus.
 
-\paragraph{Biological Motivation.}
-PCAF is loosely motivated by complementary learning systems accounts of human
-memory \citep{mcclelland1995complementary,kumaran2016learning}. These accounts
-distinguish rapid storage and retrieval of episodic information from slower
-learning of statistical regularities. We use this distinction only as a design
-analogy. The associative cache provides a direct retrieval path, the local
-parametric model captures reusable regularities, and a learned gate combines
-their predictions. We do not claim that these components model specific neural
-circuits.
+\paragraph{Biological Inspiration and Design Rationale.}
+Complementary learning systems theory distinguishes two forms of memory
+computation \citep{mcclelland1995complementary,kumaran2016learning}. The
+hippocampal system is associated with rapid binding of individual episodes and
+pattern completion from partial cues. Neocortical learning proceeds more
+gradually and extracts statistical structure shared across repeated
+experiences. This distinction motivates an architecture in which instance-level
+retrieval and parametric generalization are implemented by separate,
+cooperating components.
+
+PCAF adopts this functional separation. The associative cache stores causal
+successor records and retrieves a bounded set of records whose addresses match
+the current context. It therefore provides a rapid, instance-specific memory
+path. The local parametric network learns reusable syntactic and semantic
+regularities and can produce a prediction when no reliable cache record is
+available. The learned gate combines the two predictive distributions at each
+position, allowing the model to vary its reliance on retrieved evidence and
+parametric computation.
+
+This correspondence is a computational analogy, not a claim that PCAF models
+the biological mechanisms of the hippocampus or neocortex. Its role is to state
+the design objective clearly: retain direct access to selected past events
+without requiring dense comparison against every preceding token, while
+preserving a parametric path for generalization beyond stored contexts.
 
 The central empirical question is practical: can a simple associative memory
 recover useful long-context signal without paying the cost of dense attention?
@@ -145,7 +160,7 @@ This paper makes four concrete contributions:
   retrieval.}
   We study both exact context-hash routing and learned semantic routing. The
   context route gives fast, high-precision discrete cache hits; the semantic
-  route addresses the ``semantic silence'' of exact token hashes by allowing
+  route addresses the surface-form limitation of exact token hashing by allowing
   hidden-state-similar contexts to retrieve one another even when their surface
   forms differ. In both cases, retrieval is bounded by a small top-$K$ candidate
   set, yielding sparse memory access rather than dense attention.
@@ -241,10 +256,15 @@ indices.
 
 Figure~\ref{fig:architecture} illustrates the overall architecture of the proposed Parallel Causal Associative Field (PCAF) model. The architecture consists of a local parametric path running in parallel with a content-addressed associative memory module. Under this scheme, memory addressing and value resolution are decoupled, allowing fast subquadratic sequence processing with bounded candidate lookups.
 
-\begin{figure}[t]
+\begin{figure}[H]
   \centering
-  \includegraphics[width=0.85\linewidth]{pcaf_architecture_diagram}
-\caption{Overall architecture of PCAF. Input tokens are embedded and processed by causal depthwise convolutional blocks (left, teal) to produce hidden states $h_{1:T}$. An MLP head maps each queried state $h_t$ to a parametric distribution $p_{\mathrm{param}}$. In parallel, a hash address function routes causal successor records into $B$ hash buckets (right, indigo). A Triton bucket lookup retrieves at most $K$ candidates $\mathcal{C}(t)$, which are scored via key--query attention to form a cache distribution $p_{\mathrm{cache}}$. A learned sigmoid gate $\lambda_t$ mixes the two distributions to produce the final output (top, amber). In next-token diagnostics we query only the final state $h_T$; in full autoregressive training we apply the same computation at every causal position.}
+  \includegraphics[width=0.66\linewidth]{pcaf_architecture_diagram}
+\caption{PCAF architecture. A causal local network produces hidden states and a
+parametric token distribution. In parallel, an address function routes causal
+successor records into hash buckets. At most $K$ retrieved records are scored
+against the current query to form $p_{\mathrm{cache}}$, and a learned gate
+combines it with $p_{\mathrm{param}}$. Full autoregressive training applies this
+computation at every causal position.}
   \label{fig:architecture}
 \end{figure}
 
@@ -302,10 +322,11 @@ states:
   k_i = \mathrm{norm}(W_k h_i), \qquad q_T = \mathrm{norm}(W_q h_T).
 \end{equation}
 
-Exact token hashes are fast but semantically silent: paraphrastic contexts such
-as ``red car'' and ``scarlet automobile'' receive unrelated addresses even if
-their hidden states are nearby. We therefore also implement a learned semantic
-route. A router maps hidden states to distributions over semantic buckets,
+Exact token hashes do not capture semantic similarity. For example,
+paraphrastic contexts such as ``red car'' and ``scarlet automobile'' receive
+unrelated addresses even if their hidden states are nearby. We therefore also
+implement a learned semantic route. A router maps hidden states to distributions
+over semantic buckets,
 \begin{equation}
   \tilde{r}_i = \mathrm{softmax}(W_s h_i / \tau), \qquad
   \tilde{r}_T = \mathrm{softmax}(W_s h_T / \tau),
@@ -380,8 +401,8 @@ For numerical stability, the mixture is computed in log-space via
 The associative memory read cost per sample is $O(T + Kd)$ with $K \ll T$.
 Dense causal attention costs $O(T^2 d)$ per layer. Sliding-window attention
 reduces this to $O(Twd)$ per layer for window size $w$, but applies attention
-in every layer. PCAF replaces the multi-layer attention stack with a cheap
-local convolutional path plus one sparse memory read, yielding the throughput
+in every layer. PCAF replaces the multi-layer attention stack with a
+linear-cost local convolutional path plus one sparse memory read, yielding the throughput
 advantages reported in Table~\ref{tab:submission_303m_results} and the
 diagnostic scaling results in Tables~\ref{tab:tpu_baselines}--\ref{tab:tpu_ablations}.
 
@@ -443,22 +464,26 @@ when the global batch size exceeds 32 on the TPU v4-32. The PCAF and local
 convolutional implementations fit a global batch size of 256 because they do
 not materialize a quadratic attention matrix.
 
-On WikiText-103 at $T = 1024$, PCAF-semantic achieves a best perplexity of
-\textbf{33.30} PPL (final 33.43 PPL), outperforming the dense Transformer by \textbf{16.22 points}
-and the local convolutional baseline by \textbf{8.38 points}, while delivering a \textbf{2.02$\times$}
-speedup in training throughput (0.89M vs 0.44M tokens/s at batch size 256).
-At $T = 2048$, under a strict batch size of 32 for direct comparison, PCAF-semantic reaches a best perplexity of \textbf{36.31} PPL, outperforming the
-dense Transformer baseline by \textbf{11.18 points} with a \textbf{1.42$\times$} throughput speedup (0.61M vs 0.43M tokens/s). When allowed to scale to a batch size of 256, PCAF-semantic further accelerates to \textbf{0.89M tokens/s}, representing a \textbf{2.07$\times$} hardware speedup over the best possible attention baseline.
+On WikiText-103 at $T = 1024$, PCAF-semantic obtains a best perplexity of
+\textbf{33.30} PPL (final 33.43 PPL), which is 16.22 points below the dense
+Transformer and 8.38 points below the local convolutional baseline. Its measured
+throughput is 0.89M tokens/s at global batch size 256, compared with 0.44M
+tokens/s for the dense Transformer at global batch size 32. At $T = 2048$ and
+equal global batch size 32, PCAF-semantic obtains \textbf{36.31} PPL and 0.61M
+tokens/s, compared with 47.49 PPL and 0.43M tokens/s for the dense Transformer.
+At global batch size 256, which does not fit for the attention baselines in this
+implementation, PCAF-semantic processes 0.89M tokens/s.
 
-On PG-19, PCAF-semantic also improves perplexity over the matched baselines.
-At $T = 1024$, PCAF-semantic achieves a best perplexity of \textbf{50.94} PPL (final 59.85 PPL), outperforming
-the local convolutional baseline by \textbf{12.85 points} and the dense Transformer by \textbf{5.36 points}.
-At $T = 2048$, PCAF-semantic obtains the lowest perplexity of \textbf{52.45} PPL, outperforming the local Transformer
-and dense baseline while retaining a \textbf{1.44$\times$} throughput advantage at batch size 32 (0.62M vs 0.43M tokens/s), which expands to a \textbf{2.07$\times$} speedup (0.89M tokens/s) when running at batch size 256.
-In these runs, PCAF improves perplexity while processing more tokens per second
-than dense or local attention at the same scale.
+On PG-19 at $T = 1024$, PCAF-semantic obtains a best perplexity of
+\textbf{50.94} PPL (final 59.85 PPL), 5.36 points below the dense Transformer
+and 12.85 points below the local convolutional baseline. At $T = 2048$ and
+global batch size 32, PCAF-semantic obtains \textbf{52.45} PPL at 0.62M
+tokens/s; the dense Transformer obtains 53.84 PPL at 0.43M tokens/s, and the
+local Transformer obtains 54.54 PPL at 0.43M tokens/s. These measurements show
+the quality and throughput differences separately from the additional
+throughput available to PCAF at larger batch sizes.
 
-\begin{table}[!t]
+\begin{table}[H]
   \centering
   \caption{Large-scale full autoregressive JAX results on a Google Cloud TPU v4-32 cluster. All models are trained at sequence lengths $T=1024$ and $T=2048$; throughput is measured across the full TPU pod in millions of tokens per second (M tok/s). The number in parentheses denotes the global batch size. Dense and local attention baselines trigger out-of-memory (OOM) errors at batch size 256 for sequence length $T=2048$, limiting them to a maximum batch size of 32.}
   \label{tab:submission_303m_results}
@@ -503,7 +528,6 @@ than dense or local attention at the same scale.
   }
   \endgroup
 \end{table}
-\FloatBarrier
 
 \begin{figure}[H]
   \centering
@@ -619,7 +643,7 @@ learning curves and throughput.
     \textbf{global\_local\_trans} & Global-Local ($w=128, g=16$) & 1024 & 41.51M & 207.33 & 207.33 & 0.2310 & 10.44 M tok/s & 4.67 \\
                                   &                              & 2048 & 41.71M & 287.39 & 287.39 & 0.2103 & 7.15 M tok/s & 6.67 \\
     \midrule
-    \textbf{local\_conv} (No cache) & --- & 2048 & 41.74M & 118.12 & 118.12 & 0.2676 & \textbf{45.82 M tok/s} & \textbf{4.18} \\
+    \textbf{local\_conv} (No cache) & N/A & 2048 & 41.74M & 118.12 & 118.12 & 0.2676 & \textbf{45.82 M tok/s} & \textbf{4.18} \\
     \bottomrule
   \end{tabular}
   }
