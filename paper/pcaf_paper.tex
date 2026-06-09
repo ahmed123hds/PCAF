@@ -62,7 +62,7 @@ WikiText-103 and 52.45 perplexity on PG-19, compared with 47.49 and 53.84 for
 a matched dense Transformer. PCAF-semantic simultaneously processes
 0.61--0.62M tokens/s across the TPU pod, versus 0.43M tokens/s for dense and
 local attention baselines. Supporting 41M-parameter multi-seed sweeps and
-single-GPU component ablations confirm that the associative cache, retrieval
+single-GPU component ablations show that the associative cache, retrieval
 capacity, and learned gate materially affect the speed--quality trade-off.
 \end{abstract}
 
@@ -84,7 +84,7 @@ Transformer restrict the attention graph to structured subsets of token pairs
 \citep{beltagy2020longformer,zaheer2020bigbird,child2019sparsetransformer}.
 Linear attention approximates the softmax kernel to achieve $O(T)$ per-layer
 complexity \citep{katharopoulos2020linearattn}. Recurrent architectures based
-on structured state spaces—most notably S4 and Mamba—achieve linear-time
+on structured state spaces, including S4 and Mamba, achieve linear-time
 sequence processing through selective state updates
 \citep{gu2021s4,gu2023mamba}. Each of these approaches makes a distinct
 trade-off: sparse attention limits the communication graph, linear attention
@@ -104,20 +104,15 @@ inspiration from memory-augmented neural networks
 language models \citep{borgeaud2022retro,izacard2022atlas}, but operates
 \emph{within} a single context window without an external corpus.
 
-\paragraph{Biological Inspiration.}
-The architectural separation at the heart of PCAF---between \emph{memory addressing} and \emph{value resolution}---is directly inspired by the complementary learning systems theory of human memory
-\citep{mcclelland1995complementary,kumaran2016learning}.
-In the mammalian brain, the \textbf{hippocampus} acts as a rapid-binding content-addressable index: it encodes episodic events by writing a sparse, high-dimensional pattern that links contextual cues to a stored experience.
-When a familiar context recurs, the hippocampus performs \emph{pattern completion}---retrieving the associated memory from a very sparse cue, even in the presence of interference.
-The \textbf{neocortex}, by contrast, slowly distills statistical regularities across many exposures into dense parametric weights, providing smooth, compositional generalization.
-Crucially, these two systems operate in parallel and are gated by a learned routing signal: the brain dynamically arbitrates between direct episodic recall (``I have seen this context before, retrieve the exact successor'') and parametric generalization (``compose a novel output from learned rules'').
-
-PCAF mirrors this two-system architecture precisely.
-The \emph{parametric local path}---a causal convolutional or state-space module---plays the role of the neocortex, providing smooth, parameter-efficient modeling of local syntactic and semantic compositionality.
-The \emph{content-addressed cache}---a polynomial hash-bucket memory of causal successor records---plays the role of the hippocampus, performing fast, high-fidelity retrieval of previously encountered context continuations.
-The \emph{learned gate} plays the role of the hippocampal--neocortical router, dynamically weighting episodic cache recall against parametric model output at every token position.
-This biologically grounded separation of labor eliminates the compression bottleneck of purely recurrent architectures (which force unlimited history into a fixed-size state, analogous to removing the hippocampus and relying solely on neocortical weights), while simultaneously avoiding the $O(T^2)$ cost of querying all past tokens uniformly, as dense attention does.
-The result is a model that learns \emph{when} to look up and \emph{when} to compose---a property we demonstrate empirically to be both computationally efficient and statistically powerful across long-range pretraining benchmarks.
+\paragraph{Biological Motivation.}
+PCAF is loosely motivated by complementary learning systems accounts of human
+memory \citep{mcclelland1995complementary,kumaran2016learning}. These accounts
+distinguish rapid storage and retrieval of episodic information from slower
+learning of statistical regularities. We use this distinction only as a design
+analogy. The associative cache provides a direct retrieval path, the local
+parametric model captures reusable regularities, and a learned gate combines
+their predictions. We do not claim that these components model specific neural
+circuits.
 
 The central empirical question is practical: can a simple associative memory
 recover useful long-context signal without paying the cost of dense attention?
@@ -180,8 +175,8 @@ tokens \citep{beltagy2020longformer}; BigBird adds random attention edges and
 studies the theoretical expressivity of sparse patterns
 \citep{zaheer2020bigbird}. The Sparse Transformer \citep{child2019sparsetransformer}
 introduces strided and fixed factorizations of the attention matrix. Positional
-encoding improvements—including ALiBi \citep{press2021alibi} and RoPE
-\citep{su2021roformer}—partially mitigate length-generalization failures but do
+encoding improvements, including ALiBi \citep{press2021alibi} and RoPE
+\citep{su2021roformer}, partially mitigate length-generalization failures but do
 not change the asymptotic complexity of attention. PCAF does not attend over a
 fixed sparse graph at all; instead it writes and reads causal successor records
 from a content-addressed hash memory.
@@ -205,7 +200,7 @@ at linear cost \citep{gu2023mamba}. Mamba-2 \citep{dao2024mamba2} establishes
 a theoretical duality between state-space models and structured attention.
 RWKV \citep{peng2023rwkv} adopts a linear recurrence with token-mixing
 analogous to time-decay attention. RetNet \citep{sun2023retnet} introduces
-retention—a decay-weighted recurrence that admits both parallel and sequential
+retention, a decay-weighted recurrence that admits both parallel and sequential
 formulations. These models represent the history in a fixed-size state vector,
 which may discard fine-grained token-level patterns. PCAF instead stores
 discrete successor records and reads a bounded candidate set by address,
@@ -221,12 +216,12 @@ with a nearest-neighbor distribution over an external datastore
 \citep{khandelwal2019knn}. RETRO \citep{borgeaud2022retro} retrieves
 text chunks from a large offline corpus and attends to them with
 cross-attention. ATLAS \citep{izacard2022atlas} integrates retrieval into
-few-shot learning through joint encoder–retriever training. PCAF is closest in
+few-shot learning through joint encoder-retriever training. PCAF is closest in
 spirit to cache language models. The architectural difference is that the cache
 is constructed \emph{within} the current sequence window during the forward
 pass, uses a parallel hash-bucket candidate selection implemented as a custom
 Triton kernel, and is mixed with the parametric path through a learned gate
-trained end-to-end—without any external index or offline retrieval step.
+trained end-to-end without any external index or offline retrieval step.
 
 \paragraph{Memory-augmented neural networks.}
 Memory Networks \citep{weston2015memory} and End-to-End Memory Networks
@@ -439,9 +434,14 @@ metric used when a run begins to overfit late in training.
 Table~\ref{tab:submission_303m_results} is the main result table of the paper.
 It reports full autoregressive language modeling at 303M parameters on
 WikiText-103 and PG-19 at sequence lengths $T = 1024$ and $T = 2048$.
-Across all configurations, the PCAF models demonstrate substantial quality and throughput advantages.
+Across these configurations, PCAF gives lower perplexity and higher throughput
+than the matched dense and local attention baselines.
 
-A key factor driving these throughput gains is the superior memory footprint of PCAF. At sequence length $T = 2048$, the quadratic memory complexity of dense attention and the VRAM overhead of local Transformers trigger out-of-memory (OOM) errors on the Cloud TPU v4-32 when scaling the global batch size beyond 32. Thus, attention-based baselines are strictly capped at a batch size of 32. In contrast, by routing context features into discrete buckets, PCAF models completely bypass this memory bottleneck. Our variants, alongside the local convolutional baseline, scale seamlessly to a batch size of 256 without VRAM exhaustion.
+Memory use partly explains the throughput difference. At sequence length
+$T = 2048$, the dense and local Transformer implementations run out of memory
+when the global batch size exceeds 32 on the TPU v4-32. The PCAF and local
+convolutional implementations fit a global batch size of 256 because they do
+not materialize a quadratic attention matrix.
 
 On WikiText-103 at $T = 1024$, PCAF-semantic achieves a best perplexity of
 \textbf{33.30} PPL (final 33.43 PPL), outperforming the dense Transformer by \textbf{16.22 points}
@@ -450,12 +450,13 @@ speedup in training throughput (0.89M vs 0.44M tokens/s at batch size 256).
 At $T = 2048$, under a strict batch size of 32 for direct comparison, PCAF-semantic reaches a best perplexity of \textbf{36.31} PPL, outperforming the
 dense Transformer baseline by \textbf{11.18 points} with a \textbf{1.42$\times$} throughput speedup (0.61M vs 0.43M tokens/s). When allowed to scale to a batch size of 256, PCAF-semantic further accelerates to \textbf{0.89M tokens/s}, representing a \textbf{2.07$\times$} hardware speedup over the best possible attention baseline.
 
-On PG-19, the gap is even more pronounced due to the long-range dependency requirements of book-length sequences.
+On PG-19, PCAF-semantic also improves perplexity over the matched baselines.
 At $T = 1024$, PCAF-semantic achieves a best perplexity of \textbf{50.94} PPL (final 59.85 PPL), outperforming
 the local convolutional baseline by \textbf{12.85 points} and the dense Transformer by \textbf{5.36 points}.
 At $T = 2048$, PCAF-semantic obtains the lowest perplexity of \textbf{52.45} PPL, outperforming the local Transformer
 and dense baseline while retaining a \textbf{1.44$\times$} throughput advantage at batch size 32 (0.62M vs 0.43M tokens/s), which expands to a \textbf{2.07$\times$} speedup (0.89M tokens/s) when running at batch size 256.
-These results establish the central speed--quality claim: PCAF improves perplexity while moving more tokens per second than dense or local attention at the same scale.
+In these runs, PCAF improves perplexity while processing more tokens per second
+than dense or local attention at the same scale.
 
 \begin{table}[!t]
   \centering
@@ -775,8 +776,8 @@ strengthen the claims.
 Second, the current address is a polynomial $n$-gram hash, which provides
 effective candidate selection but cannot generalize to semantically similar
 contexts with different surface forms. Future work should explore learned
-address functions—such as a small encoder projecting contexts into discrete
-codebook entries—while retaining the sparse memory primitive.
+address functions, such as a small encoder projecting contexts into discrete
+codebook entries, while retaining the sparse memory primitive.
 
 Third, the Mamba baseline could not be evaluated at batch size 64 due to GPU
 memory constraints on this hardware. A complete efficiency comparison requires
@@ -799,20 +800,20 @@ model that replaces dense token-to-token attention with a combination of a
 local causal convolutional path and a hash-bucket successor-token cache. The
 model is trained end-to-end with a single cross-entropy loss, with no
 pre-built external index. On controlled WikiText-2 next-token prediction experiments,
-PCAF substantially outperforms dense attention, sliding-window
-attention, global-local attention, and local-conv ablations at both 1024- and
-2048-token contexts, while achieving substantially higher training throughput
-than attention-based baselines. On the larger WikiText-103 and PG-19
+PCAF gives lower perplexity than dense attention, sliding-window attention,
+global-local attention, and local-convolution ablations at both 1024- and
+2048-token contexts, while also providing higher training throughput than the
+attention baselines. On the larger WikiText-103 and PG-19
 corpora under a full autoregressive pretraining objective on a distributed TPU v4-32 cluster,
-our 303M parameter PCAF-semantic model reaches outstanding validation perplexities of
+our 303M-parameter PCAF-semantic model reaches validation perplexities of
 \textbf{33.30 PPL} at $T=1024$ and \textbf{36.31 PPL} at $T=2048$ on WikiText-103 (outperforming the
 dense Transformer baseline by up to \textbf{16.22 points}), and \textbf{50.94 PPL} at $T=1024$ and \textbf{52.45 PPL} at $T=2048$ on PG-19.
 Simultaneously, PCAF-semantic delivers a \textbf{\(1.42\times\) to \(2.02\times\) higher throughput}
 (0.89M and 0.61M tokens/second vs. 0.44M and 0.43M tokens/second on WikiText-103) than matched attention baselines.
-Ablation studies confirm that both the associative cache and the learned mixture
+Ablation studies show that both the associative cache and the learned mixture
 gate are necessary contributors to these gains. These results suggest that
-parallel content-addressed memory is a highly promising architectural primitive for
-efficient, high-quality long-context sequence modeling at scale.
+parallel content-addressed memory warrants further study as a primitive for
+efficient long-context sequence modeling.
 
 \bibliographystyle{iclr2027_conference}
 \bibliography{references}
