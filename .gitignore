@@ -1,37 +1,46 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 
-# PyTorch Checkpoints (Do not push large weights to GitHub)
+# Environments and local agent state
+.env
+.venv/
+env/
+venv/
+pytorch_env/
+.agents/
+.codex/
+.local_unrelated_backup/
+
+# Checkpoints and datasets
 *.pt
 *.pth
 *.ckpt
-best_*.pt
-
-# Data Files / Datasets
-data_pcam/
 data/
+data_pcam/
+ckpts*/
 *.h5
 *.gz
 *.part
 *.svs
 *.geojson
 
-# OS / IDE
-.DS_Store
-.vscode/
-.idea/
+# Experiment output
+logs/**
+*.jsonl
+*.stdout.log
+*.time.log
 
-# Environment
-venv/
-env/
-.env
-pytorch_env/
-
-# LaTeX logs
-*.log
+# LaTeX build output
 *.aux
+*.blg
+*.log
 *.out
 *.toc
 *.synctex.gz
+
+# OS and editors
+.DS_Store
+.vscode/
+.idea/

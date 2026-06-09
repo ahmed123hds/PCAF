@@ -1,0 +1,189 @@
+\begin{thebibliography}{24}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Bahdanau et~al.(2015)Bahdanau, Cho, and Bengio]{bahdanau2015attention}
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio.
+\newblock Neural machine translation by jointly learning to align and
+  translate.
+\newblock In \emph{International Conference on Learning Representations}, 2015.
+
+\bibitem[Beltagy et~al.(2020)Beltagy, Peters, and Cohan]{beltagy2020longformer}
+Iz~Beltagy, Matthew~E. Peters, and Arman Cohan.
+\newblock Longformer: The long-document transformer.
+\newblock \emph{arXiv preprint arXiv:2004.05150}, 2020.
+
+\bibitem[Borgeaud et~al.(2022)Borgeaud, Mensch, Hoffmann, Cai, Rutherford,
+  Millican, Van Den~Driessche, Lespiau, Damoc, Clark, De~Las~Casas, Guy,
+  Menick, Ring, Hennigan, Huang, Maggiore, Jones, Cassirer, Brock, Paganini,
+  Irving, Vinyals, Osindero, Simonyan, Rae, Elsen, and
+  Sifre]{borgeaud2022retro}
+Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza
+  Rutherford, Katie Millican, George~Bm Van Den~Driessche, Jean-Baptiste
+  Lespiau, Bogdan Damoc, Aidan Clark, Diego De~Las~Casas, Aurelia Guy, Jacob
+  Menick, Roman Ring, Tom Hennigan, Saffron Huang, Lora Maggiore, Chris Jones,
+  Albin Cassirer, Andy Brock, Michela Paganini, Geoffrey Irving, Oriol Vinyals,
+  Simon Osindero, Karen Simonyan, Jack~W. Rae, Erich Elsen, and Laurent Sifre.
+\newblock Improving language models by retrieving from trillions of tokens.
+\newblock In \emph{International Conference on Machine Learning}, pp.\
+  2206--2240, 2022.
+
+\bibitem[Child et~al.(2019)Child, Gray, Radford, and
+  Sutskever]{child2019sparsetransformer}
+Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever.
+\newblock Generating long sequences with sparse transformers.
+\newblock \emph{arXiv preprint arXiv:1904.10509}, 2019.
+
+\bibitem[Dai et~al.(2019)Dai, Yang, Yang, Carbonell, Le, and
+  Salakhutdinov]{dai2019transformerxl}
+Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc~V. Le, and Ruslan
+  Salakhutdinov.
+\newblock Transformer-xl: Attentive language models beyond a fixed-length
+  context.
+\newblock In \emph{Proceedings of the 57th Annual Meeting of the Association
+  for Computational Linguistics}, pp.\  2978--2988, 2019.
+
+\bibitem[Dao \& Gu(2024)Dao and Gu]{dao2024mamba2}
+Tri Dao and Albert Gu.
+\newblock Transformers are {SSM}s: Generalized models and efficient algorithms
+  through structured state space duality.
+\newblock \emph{arXiv preprint arXiv:2405.21060}, 2024.
+
+\bibitem[Grave et~al.(2016)Grave, Joulin, Ciss{\'e}, Grangier, and
+  J{\'e}gou]{grave2016continuous}
+Edouard Grave, Armand Joulin, Moustapha Ciss{\'e}, David Grangier, and
+  Herv{\'e} J{\'e}gou.
+\newblock Improving neural language models with a continuous cache.
+\newblock \emph{arXiv preprint arXiv:1612.04426}, 2016.
+
+\bibitem[Graves et~al.(2014)Graves, Wayne, and Danihelka]{graves2014neural}
+Alex Graves, Greg Wayne, and Ivo Danihelka.
+\newblock Neural turing machines.
+\newblock \emph{arXiv preprint arXiv:1410.5401}, 2014.
+
+\bibitem[Gu \& Dao(2023)Gu and Dao]{gu2023mamba}
+Albert Gu and Tri Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock \emph{arXiv preprint arXiv:2312.00752}, 2023.
+
+\bibitem[Gu et~al.(2021)Gu, Goel, and R\'{e}]{gu2021s4}
+Albert Gu, Karan Goel, and Christopher R\'{e}.
+\newblock Efficiently modeling long sequences with structured state spaces.
+\newblock \emph{arXiv preprint arXiv:2111.00396}, 2021.
+
+\bibitem[Izacard et~al.(2023)Izacard, Lewis, Lomeli, Hosseini, Petroni, Schick,
+  Dwivedi-Yu, Joulin, Riedel, and Grave]{izacard2022atlas}
+Gautier Izacard, Patrick Lewis, Maria Lomeli, Lucas Hosseini, Fabio Petroni,
+  Timo Schick, Jane Dwivedi-Yu, Armand Joulin, Sebastian Riedel, and Edouard
+  Grave.
+\newblock Few-shot learning with retrieval augmented language models.
+\newblock \emph{Journal of Machine Learning Research}, 24:\penalty0 1--26,
+  2023.
+
+\bibitem[Katharopoulos et~al.(2020)Katharopoulos, Vyas, Pappas, and
+  Fleuret]{katharopoulos2020linearattn}
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Fran\c{c}ois Fleuret.
+\newblock Transformers are {RNN}s: Fast autoregressive transformers with linear
+  attention.
+\newblock In \emph{International Conference on Machine Learning}, pp.\
+  5156--5165, 2020.
+
+\bibitem[Khandelwal et~al.(2020)Khandelwal, Levy, Jurafsky, Zettlemoyer, and
+  Lewis]{khandelwal2019knn}
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke Zettlemoyer, and Mike Lewis.
+\newblock Generalization through memorization: Nearest neighbor language
+  models.
+\newblock In \emph{International Conference on Learning Representations}, 2020.
+
+\bibitem[Kumaran et~al.(2016)Kumaran, Hassabis, and
+  McClelland]{kumaran2016learning}
+Dharshan Kumaran, Demis Hassabis, and James~L McClelland.
+\newblock What learning systems do intelligent agents need? complementary
+  learning systems theory updated.
+\newblock \emph{Trends in Cognitive Sciences}, 20\penalty0 (7):\penalty0
+  512--534, 2016.
+
+\bibitem[McClelland et~al.(1995)McClelland, McNaughton, and
+  O'Reilly]{mcclelland1995complementary}
+James~L McClelland, Bruce~L McNaughton, and Randall~C O'Reilly.
+\newblock Why there are complementary learning systems in the hippocampus and
+  neocortex: insights from the successes and failures of connectionist models
+  of learning and memory.
+\newblock \emph{Psychological Review}, 102\penalty0 (3):\penalty0 419--457,
+  1995.
+
+\bibitem[Merity et~al.(2016)Merity, Xiong, Bradbury, and
+  Socher]{merity2016pointer}
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher.
+\newblock Pointer sentinel mixture models.
+\newblock \emph{arXiv preprint arXiv:1609.07843}, 2016.
+
+\bibitem[Peng et~al.(2023)Peng, Alcaide, Anthony, Albalak, Arcadinho, Biderman,
+  Cao, Cheng, Chung, Grella, GV, He, Hou, Kazienko, Kocon, Kong, Koptyra, Lau,
+  Lin, Ma, Microsofté, Mohan, Ni, Noppakun, Pan, Pareschi, Plebe, Poplawski,
+  Pos, Rajbhandari, Ristow, Sandhu, Shi, So, Subramanian, Sutawika, Szyd{\l}o,
+  Wang, Wang, Wiedemann, Wu, Zaborski, Zhang, and Zhao]{peng2023rwkv}
+Bo~Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Stella
+  Biderman, Huanqi Cao, Xin Cheng, Michael Chung, Matteo Grella, Kranthi~Kiran
+  GV, Xuzheng He, Haowen Hou, Pawel Kazienko, Jan Kocon, Jiaming Kong, Bart
+  Koptyra, Hayden Lau, Jiong Lin, Krishna Sri~Hari Ma, Ferdinand Microsofté,
+  Aditya Mohan, Leon Ni, Non Noppakun, Dang Pan, Federico Pareschi, Mimmo
+  Plebe, Maciej Poplawski, Yanzheng Pos, Samyam Rajbhandari, Filippo Ristow,
+  Jaeden Sandhu, Xichen Shi, David So, Manvi Subramanian, Lintang Sutawika,
+  Wojciech Szyd{\l}o, Peng Wang, Xiangru Wang, Samuel Wiedemann, Bryan Wu,
+  Jakub Zaborski, Zhenyuan Zhang, and Peng Zhao.
+\newblock {RWKV}: Reinventing {RNN}s for the transformer era.
+\newblock \emph{arXiv preprint arXiv:2305.13048}, 2023.
+
+\bibitem[Press et~al.(2022)Press, Smith, and Lewis]{press2021alibi}
+Ofir Press, Noah~A. Smith, and Mike Lewis.
+\newblock Train short, test long: Attention with linear biases enables input
+  length extrapolation.
+\newblock In \emph{International Conference on Learning Representations}, 2022.
+
+\bibitem[Su et~al.(2021)Su, Lu, Pan, Murtadha, Wen, and Liu]{su2021roformer}
+Jianlin Su, Yu~Lu, Shengding Pan, Ahmed Murtadha, Bo~Wen, and Yunfeng Liu.
+\newblock {RoFormer}: Enhanced transformer with rotary position embedding.
+\newblock \emph{arXiv preprint arXiv:2104.09864}, 2021.
+
+\bibitem[Sukhbaatar et~al.(2015)Sukhbaatar, Szlam, Weston, and
+  Fergus]{sukhbaatar2015end2end}
+Sainbayar Sukhbaatar, Arthur Szlam, Jason Weston, and Rob Fergus.
+\newblock End-to-end memory networks.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~28, 2015.
+
+\bibitem[Sun et~al.(2023)Sun, Dong, Huang, Ma, Xia, Xue, Wang, Huang, and
+  Wei]{sun2023retnet}
+Yutao Sun, Li~Dong, Shaohan Huang, Shuming Ma, Yuqing Xia, Jilong Xue, Jian
+  Wang, Minghao Huang, and Furu Wei.
+\newblock Retentive network: A successor to transformer for large language
+  models.
+\newblock \emph{arXiv preprint arXiv:2307.08621}, 2023.
+
+\bibitem[Vaswani et~al.(2017)Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez,
+  Kaiser, and Polosukhin]{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+  Aidan~N. Gomez, Lukasz Kaiser, and Illia Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~30, 2017.
+
+\bibitem[Weston et~al.(2015)Weston, Chopra, and Bordes]{weston2015memory}
+Jason Weston, Sumit Chopra, and Antoine Bordes.
+\newblock Memory networks.
+\newblock \emph{arXiv preprint arXiv:1410.3916}, 2015.
+
+\bibitem[Zaheer et~al.(2020)Zaheer, Guruganesh, Dubey, Ainslie, Alberti,
+  Ontanon, Pham, Ravula, Wang, Yang, and Ahmed]{zaheer2020bigbird}
+Manzil Zaheer, Guru Guruganesh, Kumar~Avinava Dubey, Joshua Ainslie, Chris
+  Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li~Yang,
+  and Amr Ahmed.
+\newblock Big bird: Transformers for longer sequences.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~33, 2020.
+
+\end{thebibliography}
